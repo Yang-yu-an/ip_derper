@@ -119,6 +119,12 @@ main() {
 				VERSION="bionic"
 				APT_KEY_TYPE="legacy"
 				;;
+			pureos)
+				OS="debian"
+				PACKAGETYPE="apt"
+				VERSION="bullseye"
+				APT_KEY_TYPE="keyring"
+				;;
 			raspbian)
 				OS="$ID"
 				VERSION="$VERSION_CODENAME"
@@ -145,6 +151,15 @@ main() {
 					APT_KEY_TYPE="legacy"
 				else
 					VERSION="bullseye"
+					APT_KEY_TYPE="keyring"
+				fi
+				;;
+			Deepin)  # https://github.com/tailscale/tailscale/issues/7862
+				OS="debian"
+				PACKAGETYPE="apt"
+				if [ "$VERSION_ID" -lt 20 ]; then
+					APT_KEY_TYPE="legacy"
+				else
 					APT_KEY_TYPE="keyring"
 				fi
 				;;
@@ -177,7 +192,7 @@ main() {
 				VERSION=""
 				PACKAGETYPE="dnf"
 				;;
-			rocky|almalinux|nobara|openmandriva|sangoma)
+			rocky|almalinux|nobara|openmandriva|sangoma|risios)
 				OS="fedora"
 				VERSION=""
 				PACKAGETYPE="dnf"
@@ -249,6 +264,11 @@ main() {
 				VERSION="bullseye"
 				APT_KEY_TYPE="keyring"
 				;;
+			photon)
+				OS="photon"
+				VERSION="$(echo "$VERSION_ID" | cut -f1 -d.)"
+				PACKAGETYPE="tdnf"
+				;;
 
 			# TODO: wsl?
 			# TODO: synology? qnap?
@@ -287,80 +307,39 @@ main() {
 		fi
 	fi
 
+	# Ideally we want to use curl, but on some installs we
+	# only have wget. Detect and use what's available.
+	CURL=
+	if type curl >/dev/null; then
+		CURL="curl -fsSL"
+	elif type wget >/dev/null; then
+		CURL="wget -q -O-"
+	fi
+	if [ -z "$CURL" ]; then
+		echo "The installer needs either curl or wget to download files."
+		echo "Please install either curl or wget to proceed."
+		exit 1
+	fi
+
+	TEST_URL="https://pkgs.tailscale.com/"
+	RC=0
+	TEST_OUT=$($CURL "$TEST_URL" 2>&1) || RC=$?
+	if [ $RC != 0 ]; then
+		echo "The installer cannot reach $TEST_URL"
+		echo "Please make sure that your machine has internet access."
+		echo "Test output:"
+		echo $TEST_OUT
+		exit 1
+	fi
+
 	# Step 2: having detected an OS we support, is it one of the
 	# versions we support?
 	OS_UNSUPPORTED=
 	case "$OS" in
-		ubuntu)
-			if [ "$VERSION" != "xenial" ] && \
-			   [ "$VERSION" != "bionic" ] && \
-			   [ "$VERSION" != "eoan" ] && \
-			   [ "$VERSION" != "focal" ] && \
-			   [ "$VERSION" != "groovy" ] && \
-			   [ "$VERSION" != "hirsute" ] && \
-			   [ "$VERSION" != "impish" ] && \
-			   [ "$VERSION" != "jammy" ] && \
-			   [ "$VERSION" != "kinetic" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		debian)
-			if [ "$VERSION" != "stretch" ] && \
-			   [ "$VERSION" != "buster" ] && \
-			   [ "$VERSION" != "bullseye" ] && \
-			   [ "$VERSION" != "bookworm" ] && \
-			   [ "$VERSION" != "sid" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		raspbian)
-			if [ "$VERSION" != "stretch" ] && \
-			   [ "$VERSION" != "buster" ] && \
-			   [ "$VERSION" != "bullseye" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		centos)
-			if [ "$VERSION" != "7" ] && \
-			   [ "$VERSION" != "8" ] && \
-			   [ "$VERSION" != "9" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		oracle)
-			if [ "$VERSION" != "7" ] && \
-			   [ "$VERSION" != "8" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		rhel)
-			if [ "$VERSION" != "7" ] && \
-			   [ "$VERSION" != "8" ] && \
-			   [ "$VERSION" != "9" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		amazon-linux)
-			if [ "$VERSION" != "2" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		opensuse)
-			if [ "$VERSION" != "leap/15.1" ] && \
-			   [ "$VERSION" != "leap/15.2" ] && \
-			   [ "$VERSION" != "leap/15.3" ] && \
-			   [ "$VERSION" != "leap/15.4" ] && \
-			   [ "$VERSION" != "tumbleweed" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
+		ubuntu|debian|raspbian|centos|oracle|rhel|amazon-linux|opensuse|photon)
+			# Check with the package server whether a given version is supported.
+			URL="https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/installer-supported"
+			$CURL "$URL" 2> /dev/null | grep -q OK || OS_UNSUPPORTED=1
 			;;
 		fedora)
 			# All versions supported, no version checking required.
@@ -462,22 +441,11 @@ main() {
 
 
 	# Step 4: run the installation.
-	echo "Installing Tailscale for $OS $VERSION, using method $PACKAGETYPE"
+	OSVERSION="$OS"
+	[ "$VERSION" != "" ] && OSVERSION="$OSVERSION $VERSION"
+	echo "Installing Tailscale for $OSVERSION, using method $PACKAGETYPE"
 	case "$PACKAGETYPE" in
 		apt)
-			# Ideally we want to use curl, but on some installs we
-			# only have wget. Detect and use what's available.
-			CURL=
-			if type curl >/dev/null; then
-				CURL="curl -fsSL"
-			elif type wget >/dev/null; then
-				CURL="wget -q -O-"
-			fi
-			if [ -z "$CURL" ]; then
-				echo "The installer needs either curl or wget to download files."
-				echo "Please install either curl or wget to proceed."
-				exit 1
-			fi
 			export DEBIAN_FRONTEND=noninteractive
 			if [ "$APT_KEY_TYPE" = "legacy" ] && ! type gpg >/dev/null; then
 				$SUDO apt-get update
@@ -514,21 +482,30 @@ main() {
 		;;
 		dnf)
 			set -x
+			$SUDO dnf install -y 'dnf-command(config-manager)'
 			$SUDO dnf config-manager --add-repo "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
 			$SUDO dnf install -y tailscale
 			$SUDO systemctl enable --now tailscaled
 			set +x
 		;;
+		tdnf)
+			set -x
+			curl -fsSL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo" > /etc/yum.repos.d/tailscale.repo
+			$SUDO tdnf install -y tailscale
+			$SUDO systemctl enable --now tailscaled
+			set +x
+		;;
 		zypper)
 			set -x
-			$SUDO zypper ar -g -r "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
-			$SUDO zypper ref
-			$SUDO zypper in tailscale
+			$SUDO zypper --non-interactive ar -g -r "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			$SUDO zypper --non-interactive --gpg-auto-import-keys refresh
+			$SUDO zypper --non-interactive install tailscale
 			$SUDO systemctl enable --now tailscaled
 			set +x
 			;;
 		pacman)
 			set -x
+			$SUDO pacman -Sy
 			$SUDO pacman -S tailscale --noconfirm
 			$SUDO systemctl enable --now tailscaled
 			set +x
@@ -548,7 +525,7 @@ main() {
 			;;
 		xbps)
 			set -x
-			$SUDO xbps-install tailscale -y 
+			$SUDO xbps-install tailscale -y
 			set +x
 			;;
 		emerge)

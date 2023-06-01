@@ -20,7 +20,6 @@ import (
 	"log/syslog"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -31,16 +30,12 @@ import (
 	"github.com/creack/pty"
 	"github.com/pkg/sftp"
 	"github.com/u-root/u-root/pkg/termios"
-	"go4.org/mem"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/exp/slices"
 	"golang.org/x/sys/unix"
 	"tailscale.com/cmd/tailscaled/childproc"
-	"tailscale.com/envknob"
-	"tailscale.com/hostinfo"
 	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/types/logger"
-	"tailscale.com/util/lineread"
 	"tailscale.com/version/distro"
 )
 
@@ -83,7 +78,7 @@ func (ss *sshSession) newIncubatorCommand() (cmd *exec.Cmd) {
 	case "sftp":
 		isSFTP = true
 	case "":
-		name = loginShell(ss.conn.localUser)
+		name = ss.conn.localUser.LoginShell()
 		if rawCmd := ss.RawCommand(); rawCmd != "" {
 			args = append(args, "-c", rawCmd)
 		} else {
@@ -102,7 +97,7 @@ func (ss *sshSession) newIncubatorCommand() (cmd *exec.Cmd) {
 	ci := ss.conn.info
 	gids := strings.Join(ss.conn.userGroupIDs, ",")
 	remoteUser := ci.uprof.LoginName
-	if len(ci.node.Tags) > 0 {
+	if ci.node.IsTagged() {
 		remoteUser = strings.Join(ci.node.Tags, ",")
 	}
 
@@ -160,7 +155,7 @@ func (stdRWC) Close() error {
 }
 
 type incubatorArgs struct {
-	uid          uint64
+	uid          int
 	gid          int
 	groups       string
 	localUser    string
@@ -177,7 +172,7 @@ type incubatorArgs struct {
 
 func parseIncubatorArgs(args []string) (a incubatorArgs) {
 	flags := flag.NewFlagSet("", flag.ExitOnError)
-	flags.Uint64Var(&a.uid, "uid", 0, "the uid of local-user")
+	flags.IntVar(&a.uid, "uid", 0, "the uid of local-user")
 	flags.IntVar(&a.gid, "gid", 0, "the gid of local-user")
 	flags.StringVar(&a.groups, "groups", "", "comma-separated list of gids of local-user")
 	flags.StringVar(&a.localUser, "local-user", "", "the user to run as")
@@ -204,6 +199,16 @@ func parseIncubatorArgs(args []string) (a incubatorArgs) {
 // OS, sets its UID and groups to the specified `--uid`, `--gid` and
 // `--groups` and then launches the requested `--cmd`.
 func beIncubator(args []string) error {
+	// To defend against issues like https://golang.org/issue/1435,
+	// defensively lock our current goroutine's thread to the current
+	// system thread before we start making any UID/GID/group changes.
+	//
+	// This shouldn't matter on Linux because syscall.AllThreadsSyscall is
+	// used to invoke syscalls on all OS threads, but (as of 2023-03-23)
+	// that function is not implemented on all platforms.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	ia := parseIncubatorArgs(args)
 	if ia.isSFTP && ia.isShell {
 		return fmt.Errorf("--sftp and --shell are mutually exclusive")
@@ -217,7 +222,7 @@ func beIncubator(args []string) error {
 		}
 	}
 
-	euid := uint64(os.Geteuid())
+	euid := os.Geteuid()
 	runningAsRoot := euid == 0
 	if runningAsRoot && ia.loginCmdPath != "" {
 		// Check if we can exec into the login command instead of trying to
@@ -235,6 +240,7 @@ func beIncubator(args []string) error {
 	if err == nil && sessionCloser != nil {
 		defer sessionCloser()
 	}
+
 	var groupIDs []int
 	for _, g := range strings.Split(ia.groups, ",") {
 		gid, err := strconv.ParseInt(g, 10, 32)
@@ -244,22 +250,10 @@ func beIncubator(args []string) error {
 		groupIDs = append(groupIDs, int(gid))
 	}
 
-	if err := setGroups(groupIDs); err != nil {
+	if err := dropPrivileges(logf, ia.uid, ia.gid, groupIDs); err != nil {
 		return err
 	}
-	if egid := os.Getegid(); egid != ia.gid {
-		if err := syscall.Setgid(int(ia.gid)); err != nil {
-			logf(err.Error())
-			os.Exit(1)
-		}
-	}
-	if euid != ia.uid {
-		// Switch users if required before starting the desired process.
-		if err := syscall.Setuid(int(ia.uid)); err != nil {
-			logf(err.Error())
-			os.Exit(1)
-		}
-	}
+
 	if ia.isSFTP {
 		logf("handling sftp")
 
@@ -304,6 +298,118 @@ func beIncubator(args []string) error {
 	return err
 }
 
+const (
+	// This controls whether we assert that our privileges were dropped
+	// using geteuid/getegid; it's a const and not an envknob because the
+	// incubator doesn't see the parent's environment.
+	//
+	// TODO(andrew): remove this const and always do this after sufficient
+	// testing, e.g. the 1.40 release
+	assertPrivilegesWereDropped = true
+
+	// TODO(andrew-d): verify that this works in more configurations before
+	// enabling by default.
+	assertPrivilegesWereDroppedByAttemptingToUnDrop = false
+)
+
+// dropPrivileges contains all the logic for dropping privileges to a different
+// UID, GID, and set of supplementary groups. This function is
+// security-sensitive and ordering-dependent; please be very cautious if/when
+// refactoring.
+//
+// WARNING: if you change this function, you *MUST* run the TestDropPrivileges
+// test in this package as root on at least Linux, FreeBSD and Darwin. This can
+// be done by running:
+//
+//	go test -c ./ssh/tailssh/ && sudo ./tailssh.test -test.v -test.run TestDropPrivileges
+func dropPrivileges(logf logger.Logf, wantUid, wantGid int, supplementaryGroups []int) error {
+	fatalf := func(format string, args ...any) {
+		logf("[unexpected] error dropping privileges: "+format, args...)
+		os.Exit(1)
+	}
+
+	euid := os.Geteuid()
+	egid := os.Getegid()
+
+	if runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" {
+		// On FreeBSD and Darwin, the first entry returned from the
+		// getgroups(2) syscall is the egid, and changing it with
+		// setgroups(2) changes the egid of the process. This is
+		// technically a violation of the POSIX standard; see the
+		// following article for more detail:
+		//    https://www.usenix.org/system/files/login/articles/325-tsafrir.pdf
+		//
+		// In this case, we add an entry at the beginning of the
+		// groupIDs list containing the expected gid if it's not
+		// already there, which modifies the egid and additional groups
+		// as one unit.
+		if len(supplementaryGroups) == 0 || supplementaryGroups[0] != wantGid {
+			supplementaryGroups = append([]int{wantGid}, supplementaryGroups...)
+		}
+	}
+
+	if err := setGroups(supplementaryGroups); err != nil {
+		return err
+	}
+	if egid != wantGid {
+		// On FreeBSD and Darwin, we may have already called the
+		// equivalent of setegid(wantGid) via the call to setGroups,
+		// above. However, per the manpage, setgid(getegid()) is an
+		// allowed operation regardless of privilege level.
+		//
+		// FreeBSD:
+		//	The setgid() system call is permitted if the specified ID
+		//	is equal to the real group ID or the effective group ID
+		//	of the process, or if the effective user ID is that of
+		//	the super user.
+		//
+		// Darwin:
+		//	The setgid() function is permitted if the effective
+		//	user ID is that of the super user, or if the specified
+		//	group ID is the same as the effective group ID.  If
+		//	not, but the specified group ID is the same as the real
+		//	group ID, setgid() will set the effective group ID to
+		//	the real group ID.
+		if err := syscall.Setgid(wantGid); err != nil {
+			fatalf("Setgid(%d): %v", wantGid, err)
+		}
+	}
+	if euid != wantUid {
+		// Switch users if required before starting the desired process.
+		if err := syscall.Setuid(wantUid); err != nil {
+			fatalf("Setuid(%d): %v", wantUid, err)
+		}
+	}
+
+	// If we changed either the UID or GID, defensively assert that we
+	// cannot reset the it back to our original values, and that the
+	// current egid/euid are the expected values after we change
+	// everything; if not, we exit the process.
+	if assertPrivilegesWereDroppedByAttemptingToUnDrop {
+		if egid != wantGid {
+			if err := syscall.Setegid(egid); err == nil {
+				fatalf("able to set egid back to %d", egid)
+			}
+		}
+		if euid != wantUid {
+			if err := syscall.Seteuid(euid); err == nil {
+				fatalf("able to set euid back to %d", euid)
+			}
+		}
+	}
+	if assertPrivilegesWereDropped {
+		if got := os.Getegid(); got != wantGid {
+			fatalf("got egid=%d, want %d", got, wantGid)
+		}
+		if got := os.Geteuid(); got != wantUid {
+			fatalf("got euid=%d, want %d", got, wantUid)
+		}
+		// TODO(andrew-d): assert that our supplementary groups are correct
+	}
+
+	return nil
+}
+
 // launchProcess launches an incubator process for the provided session.
 // It is responsible for configuring the process execution environment.
 // The caller can wait for the process to exit by calling cmd.Wait().
@@ -346,7 +452,7 @@ func (ss *sshSession) launchProcess() error {
 		return ss.startWithStdPipes()
 	}
 	ss.ptyReq = &ptyReq
-	pty, err := ss.startWithPTY()
+	pty, tty, err := ss.startWithPTY()
 	if err != nil {
 		return err
 	}
@@ -355,10 +461,13 @@ func (ss *sshSession) launchProcess() error {
 	// dup.
 	ptyDup, err := syscall.Dup(int(pty.Fd()))
 	if err != nil {
+		pty.Close()
+		tty.Close()
 		return err
 	}
 	go resizeWindow(ptyDup /* arbitrary fd */, winCh)
 
+	ss.tty = tty
 	ss.stdin = pty
 	ss.stdout = os.NewFile(uintptr(ptyDup), pty.Name())
 	ss.stderr = nil // not available for pty
@@ -437,18 +546,17 @@ var opcodeShortName = map[uint8]string{
 	gossh.TTY_OP_OSPEED: "tty_op_ospeed",
 }
 
-// startWithPTY starts cmd with a psuedo-terminal attached to Stdin, Stdout and Stderr.
-func (ss *sshSession) startWithPTY() (ptyFile *os.File, err error) {
+// startWithPTY starts cmd with a pseudo-terminal attached to Stdin, Stdout and Stderr.
+func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
 	ptyReq := ss.ptyReq
 	cmd := ss.cmd
 	if cmd == nil {
-		return nil, errors.New("nil ss.cmd")
+		return nil, nil, errors.New("nil ss.cmd")
 	}
 	if ptyReq == nil {
-		return nil, errors.New("nil ss.ptyReq")
+		return nil, nil, errors.New("nil ss.ptyReq")
 	}
 
-	var tty *os.File
 	ptyFile, tty, err = pty.Open()
 	if err != nil {
 		err = fmt.Errorf("pty.Open: %w", err)
@@ -462,7 +570,7 @@ func (ss *sshSession) startWithPTY() (ptyFile *os.File, err error) {
 	}()
 	ptyRawConn, err := tty.SyscallConn()
 	if err != nil {
-		return nil, fmt.Errorf("SyscallConn: %w", err)
+		return nil, nil, fmt.Errorf("SyscallConn: %w", err)
 	}
 	var ctlErr error
 	if err := ptyRawConn.Control(func(fd uintptr) {
@@ -509,10 +617,10 @@ func (ss *sshSession) startWithPTY() (ptyFile *os.File, err error) {
 			return
 		}
 	}); err != nil {
-		return nil, fmt.Errorf("ptyRawConn.Control: %w", err)
+		return nil, nil, fmt.Errorf("ptyRawConn.Control: %w", err)
 	}
 	if ctlErr != nil {
-		return nil, fmt.Errorf("ptyRawConn.Control func: %w", ctlErr)
+		return nil, nil, fmt.Errorf("ptyRawConn.Control func: %w", ctlErr)
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setctty: true,
@@ -536,7 +644,7 @@ func (ss *sshSession) startWithPTY() (ptyFile *os.File, err error) {
 	if err = cmd.Start(); err != nil {
 		return
 	}
-	return ptyFile, nil
+	return ptyFile, tty, nil
 }
 
 // startWithStdPipes starts cmd with os.Pipe for Stdin, Stdout and Stderr.
@@ -577,112 +685,13 @@ func (ss *sshSession) startWithStdPipes() (err error) {
 	return nil
 }
 
-func loginShell(u *user.User) string {
-	switch runtime.GOOS {
-	case "linux":
-		out, _ := exec.Command("getent", "passwd", u.Uid).Output()
-		// out is "root:x:0:0:root:/root:/bin/bash"
-		f := strings.SplitN(string(out), ":", 10)
-		if len(f) > 6 {
-			return strings.TrimSpace(f[6]) // shell
-		}
-	case "darwin":
-		// Note: /Users/username is key, and not the same as u.HomeDir.
-		out, _ := exec.Command("dscl", ".", "-read", filepath.Join("/Users", u.Username), "UserShell").Output()
-		// out is "UserShell: /bin/bash"
-		s, ok := strings.CutPrefix(string(out), "UserShell: ")
-		if ok {
-			return strings.TrimSpace(s)
-		}
-	}
-	if e := os.Getenv("SHELL"); e != "" {
-		return e
-	}
-	return "/bin/sh"
-}
-
-func envForUser(u *user.User) []string {
+func envForUser(u *userMeta) []string {
 	return []string{
-		fmt.Sprintf("SHELL=" + loginShell(u)),
+		fmt.Sprintf("SHELL=" + u.LoginShell()),
 		fmt.Sprintf("USER=" + u.Username),
 		fmt.Sprintf("HOME=" + u.HomeDir),
-		fmt.Sprintf("PATH=" + defaultPathForUser(u)),
+		fmt.Sprintf("PATH=" + defaultPathForUser(&u.User)),
 	}
-}
-
-// defaultPathTmpl specifies the default PATH template to use for new sessions.
-//
-// If empty, a default value is used based on the OS & distro to match OpenSSH's
-// usually-hardcoded behavior. (see
-// https://github.com/tailscale/tailscale/issues/5285 for background).
-//
-// The template may contain @{HOME} or @{PAM_USER} which expand to the user's
-// home directory and username, respectively. (PAM is not used, despite the
-// name)
-var defaultPathTmpl = envknob.RegisterString("TAILSCALE_SSH_DEFAULT_PATH")
-
-func defaultPathForUser(u *user.User) string {
-	if s := defaultPathTmpl(); s != "" {
-		return expandDefaultPathTmpl(s, u)
-	}
-	isRoot := u.Uid == "0"
-	switch distro.Get() {
-	case distro.Debian:
-		hi := hostinfo.New()
-		if hi.Distro == "ubuntu" {
-			// distro.Get's Debian includes Ubuntu. But see if it's actually Ubuntu.
-			// Ubuntu doesn't empirically seem to distinguish between root and non-root for the default.
-			// And it includes /snap/bin.
-			return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
-		}
-		if isRoot {
-			return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-		}
-		return "/usr/local/bin:/usr/bin:/bin:/usr/bn/games"
-	case distro.NixOS:
-		return defaultPathForUserOnNixOS(u)
-	}
-	if isRoot {
-		return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	}
-	return "/usr/local/bin:/usr/bin:/bin"
-}
-
-func defaultPathForUserOnNixOS(u *user.User) string {
-	var path string
-	lineread.File("/etc/pam/environment", func(lineb []byte) error {
-		if v := pathFromPAMEnvLine(lineb, u); v != "" {
-			path = v
-			return io.EOF // stop iteration
-		}
-		return nil
-	})
-	return path
-}
-
-func pathFromPAMEnvLine(line []byte, u *user.User) (path string) {
-	if !mem.HasPrefix(mem.B(line), mem.S("PATH")) {
-		return ""
-	}
-	rest := strings.TrimSpace(strings.TrimPrefix(string(line), "PATH"))
-	if quoted, ok := strings.CutPrefix(rest, "DEFAULT="); ok {
-		if path, err := strconv.Unquote(quoted); err == nil {
-			return expandDefaultPathTmpl(path, u)
-		}
-	}
-	return ""
-}
-
-func expandDefaultPathTmpl(t string, u *user.User) string {
-	p := strings.NewReplacer(
-		"@{HOME}", u.HomeDir,
-		"@{PAM_USER}", u.Username,
-	).Replace(t)
-	if strings.Contains(p, "@{") {
-		// If there are unknown expansions, conservatively fail closed.
-		return ""
-	}
-	return p
 }
 
 // updateStringInSlice mutates ss to change the first occurrence of a

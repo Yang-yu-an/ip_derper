@@ -18,6 +18,7 @@ import (
 	. "tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
 	"tailscale.com/version"
 )
@@ -349,7 +350,8 @@ func TestNodeEqual(t *testing.T) {
 		"Capabilities",
 		"UnsignedPeerAPIOnly",
 		"ComputedName", "computedHostIfDifferent", "ComputedNameWithHost",
-		"DataPlaneAuditLogID", "Expired",
+		"DataPlaneAuditLogID", "Expired", "SelfNodeV4MasqAddrForThisPeer",
+		"IsWireGuardOnly",
 	}
 	if have := fieldsOf(reflect.TypeOf(Node{})); !reflect.DeepEqual(have, nodeHandles) {
 		t.Errorf("Node.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -533,6 +535,16 @@ func TestNodeEqual(t *testing.T) {
 			&Node{Expired: true},
 			&Node{},
 			false,
+		},
+		{
+			&Node{},
+			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			false,
+		},
+		{
+			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			true,
 		},
 	}
 	for i, tt := range tests {

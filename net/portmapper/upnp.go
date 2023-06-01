@@ -44,11 +44,21 @@ type upnpMapping struct {
 	client upnpClient
 }
 
+// upnpProtocolUDP represents the protocol name for UDP, to be used in the UPnP
+// <AddPortMapping> message in the <NewProtocol> field.
+//
+// NOTE: this must be an upper-case string, or certain routers will reject the
+// mapping request. Other implementations like miniupnp send an upper-case
+// protocol as well. See:
+//
+//	https://github.com/tailscale/tailscale/issues/7377
+const upnpProtocolUDP = "UDP"
+
 func (u *upnpMapping) GoodUntil() time.Time     { return u.goodUntil }
 func (u *upnpMapping) RenewAfter() time.Time    { return u.renewAfter }
 func (u *upnpMapping) External() netip.AddrPort { return u.external }
 func (u *upnpMapping) Release(ctx context.Context) {
-	u.client.DeletePortMapping(ctx, "", u.external.Port(), "udp")
+	u.client.DeletePortMapping(ctx, "", u.external.Port(), upnpProtocolUDP)
 }
 
 // upnpClient is an interface over the multiple different clients exported by goupnp,
@@ -69,7 +79,7 @@ type upnpClient interface {
 		// `AddAnyPortMapping` is not supported.
 		externalPort uint16,
 
-		// protocol is whether this is over TCP or UDP. Either "tcp" or "udp".
+		// protocol is whether this is over TCP or UDP. Either "TCP" or "UDP".
 		protocol string,
 
 		// internalPort is the port that the gateway device forwards the traffic to.
@@ -116,7 +126,7 @@ func addAnyPortMapping(
 			ctx,
 			"",
 			externalPort,
-			"udp",
+			upnpProtocolUDP,
 			internalPort,
 			internalClient,
 			true,
@@ -124,14 +134,21 @@ func addAnyPortMapping(
 			uint32(leaseDuration.Seconds()),
 		)
 	}
-	for externalPort == 0 {
-		externalPort = uint16(rand.Intn(65535))
+
+	// Some devices don't let clients add a port mapping for privileged
+	// ports (ports below 1024).
+	//
+	// Pick an external port that's greater than 1024 by getting a random
+	// number in [0, 65535 - 1024] and then adding 1024 to it, shifting the
+	// range to [1024, 65535].
+	if externalPort < 1024 {
+		externalPort = uint16(rand.Intn(65535-1024) + 1024)
 	}
 	err = upnp.AddPortMapping(
 		ctx,
 		"",
 		externalPort,
-		"udp",
+		upnpProtocolUDP,
 		internalPort,
 		internalClient,
 		true,
@@ -220,7 +237,7 @@ func (c *Client) upnpHTTPClientLocked() *http.Client {
 	if c.uPnPHTTPClient == nil {
 		c.uPnPHTTPClient = &http.Client{
 			Transport: &http.Transport{
-				DialContext:     netns.NewDialer(c.logf).DialContext,
+				DialContext:     netns.NewDialer(c.logf, c.netMon).DialContext,
 				IdleConnTimeout: 2 * time.Second, // LAN is cheap
 			},
 		}

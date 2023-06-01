@@ -49,7 +49,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/multierr"
-	"tailscale.com/wgengine"
+	"tailscale.com/version/distro"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -468,7 +468,7 @@ func (s *peerAPIServer) listen(ip netip.Addr, ifState *interfaces.State) (ln net
 		}
 	}
 
-	if wgengine.IsNetstack(s.b.e) {
+	if s.b.sys.IsNetstack() {
 		ipStr = ""
 	}
 
@@ -605,6 +605,16 @@ func (h *peerAPIHandler) logf(format string, a ...any) {
 	h.ps.b.logf("peerapi: "+format, a...)
 }
 
+// isAddressValid reports whether addr is a valid destination address for this
+// node originating from the peer.
+func (h *peerAPIHandler) isAddressValid(addr netip.Addr) bool {
+	if h.peerNode.SelfNodeV4MasqAddrForThisPeer != nil {
+		return *h.peerNode.SelfNodeV4MasqAddrForThisPeer == addr
+	}
+	pfx := netip.PrefixFrom(addr, addr.BitLen())
+	return slices.Contains(h.selfNode.Addresses, pfx)
+}
+
 func (h *peerAPIHandler) validateHost(r *http.Request) error {
 	if r.Host == "peer" {
 		return nil
@@ -613,9 +623,8 @@ func (h *peerAPIHandler) validateHost(r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	hostIPPfx := netip.PrefixFrom(ap.Addr(), ap.Addr().BitLen())
-	if !slices.Contains(h.selfNode.Addresses, hostIPPfx) {
-		return fmt.Errorf("%v not found in self addresses", hostIPPfx)
+	if !h.isAddressValid(ap.Addr()) {
+		return fmt.Errorf("%v not found in self addresses", ap.Addr())
 	}
 	return nil
 }
@@ -761,12 +770,12 @@ func (h *peerAPIHandler) handleServeIngress(w http.ResponseWriter, r *http.Reque
 		bad("Tailscale-Ingress-Src header invalid; want ip:port")
 		return
 	}
-	target := r.Header.Get("Tailscale-Ingress-Target")
+	target := ipn.HostPort(r.Header.Get("Tailscale-Ingress-Target"))
 	if target == "" {
 		bad("Tailscale-Ingress-Target header not set")
 		return
 	}
-	if _, _, err := net.SplitHostPort(target); err != nil {
+	if _, _, err := net.SplitHostPort(string(target)); err != nil {
 		bad("Tailscale-Ingress-Target header invalid; want host:port")
 		return
 	}
@@ -779,13 +788,17 @@ func (h *peerAPIHandler) handleServeIngress(w http.ResponseWriter, r *http.Reque
 			return nil, false
 		}
 		io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n\r\n")
-		return conn, true
+		return &ipn.FunnelConn{
+			Conn:   conn,
+			Src:    srcAddr,
+			Target: target,
+		}, true
 	}
 	sendRST := func() {
 		http.Error(w, "denied", http.StatusForbidden)
 	}
 
-	h.ps.b.HandleIngressTCPConn(h.peerNode, ipn.HostPort(target), srcAddr, getConn, sendRST)
+	h.ps.b.HandleIngressTCPConn(h.peerNode, target, srcAddr, getConn, sendRST)
 }
 
 func (h *peerAPIHandler) handleServeInterfaces(w http.ResponseWriter, r *http.Request) {
@@ -861,7 +874,12 @@ func (h *peerAPIHandler) handleServeSockStats(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintln(w, "<!DOCTYPE html><h1>Socket Stats</h1>")
 
-	stats := sockstats.Get()
+	if !sockstats.IsAvailable {
+		fmt.Fprintln(w, "Socket stats are not available for this client")
+		return
+	}
+
+	stats, interfaceStats, validation := sockstats.Get(), sockstats.GetInterfaces(), sockstats.GetValidation()
 	if stats == nil {
 		fmt.Fprintln(w, "No socket stats available")
 		return
@@ -872,40 +890,56 @@ func (h *peerAPIHandler) handleServeSockStats(w http.ResponseWriter, r *http.Req
 	fmt.Fprintln(w, "<th>Label</th>")
 	fmt.Fprintln(w, "<th>Tx</th>")
 	fmt.Fprintln(w, "<th>Rx</th>")
-	for _, iface := range stats.Interfaces {
+	for _, iface := range interfaceStats.Interfaces {
 		fmt.Fprintf(w, "<th>Tx (%s)</th>", html.EscapeString(iface))
 		fmt.Fprintf(w, "<th>Rx (%s)</th>", html.EscapeString(iface))
 	}
+	fmt.Fprintln(w, "<th>Validation</th>")
 	fmt.Fprintln(w, "</thead>")
 
 	fmt.Fprintln(w, "<tbody>")
-	labels := make([]string, 0, len(stats.Stats))
+	labels := make([]sockstats.Label, 0, len(stats.Stats))
 	for label := range stats.Stats {
 		labels = append(labels, label)
 	}
-	sort.Strings(labels)
+	slices.SortFunc(labels, func(a, b sockstats.Label) bool {
+		return a.String() < b.String()
+	})
 
-	txTotal := int64(0)
-	rxTotal := int64(0)
-	txTotalByInterface := map[string]int64{}
-	rxTotalByInterface := map[string]int64{}
+	txTotal := uint64(0)
+	rxTotal := uint64(0)
+	txTotalByInterface := map[string]uint64{}
+	rxTotalByInterface := map[string]uint64{}
 
 	for _, label := range labels {
 		stat := stats.Stats[label]
 		fmt.Fprintln(w, "<tr>")
-		fmt.Fprintf(w, "<td>%s</td>", html.EscapeString(label))
+		fmt.Fprintf(w, "<td>%s</td>", html.EscapeString(label.String()))
 		fmt.Fprintf(w, "<td align=right>%d</td>", stat.TxBytes)
 		fmt.Fprintf(w, "<td align=right>%d</td>", stat.RxBytes)
 
 		txTotal += stat.TxBytes
 		rxTotal += stat.RxBytes
 
-		for _, iface := range stats.Interfaces {
-			fmt.Fprintf(w, "<td align=right>%d</td>", stat.TxBytesByInterface[iface])
-			fmt.Fprintf(w, "<td align=right>%d</td>", stat.RxBytesByInterface[iface])
-			txTotalByInterface[iface] += stat.TxBytesByInterface[iface]
-			rxTotalByInterface[iface] += stat.RxBytesByInterface[iface]
+		if interfaceStat, ok := interfaceStats.Stats[label]; ok {
+			for _, iface := range interfaceStats.Interfaces {
+				fmt.Fprintf(w, "<td align=right>%d</td>", interfaceStat.TxBytesByInterface[iface])
+				fmt.Fprintf(w, "<td align=right>%d</td>", interfaceStat.RxBytesByInterface[iface])
+				txTotalByInterface[iface] += interfaceStat.TxBytesByInterface[iface]
+				rxTotalByInterface[iface] += interfaceStat.RxBytesByInterface[iface]
+			}
 		}
+
+		if validationStat, ok := validation.Stats[label]; ok && (validationStat.RxBytes > 0 || validationStat.TxBytes > 0) {
+			fmt.Fprintf(w, "<td>Tx=%d (%+d) Rx=%d (%+d)</td>",
+				validationStat.TxBytes,
+				int64(validationStat.TxBytes)-int64(stat.TxBytes),
+				validationStat.RxBytes,
+				int64(validationStat.RxBytes)-int64(stat.RxBytes))
+		} else {
+			fmt.Fprintln(w, "<td></td>")
+		}
+
 		fmt.Fprintln(w, "</tr>")
 	}
 	fmt.Fprintln(w, "</tbody>")
@@ -914,13 +948,20 @@ func (h *peerAPIHandler) handleServeSockStats(w http.ResponseWriter, r *http.Req
 	fmt.Fprintln(w, "<th>Total</th>")
 	fmt.Fprintf(w, "<th>%d</th>", txTotal)
 	fmt.Fprintf(w, "<th>%d</th>", rxTotal)
-	for _, iface := range stats.Interfaces {
+	for _, iface := range interfaceStats.Interfaces {
 		fmt.Fprintf(w, "<th>%d</th>", txTotalByInterface[iface])
 		fmt.Fprintf(w, "<th>%d</th>", rxTotalByInterface[iface])
 	}
+	fmt.Fprintln(w, "<th></th>")
 	fmt.Fprintln(w, "</tfoot>")
 
 	fmt.Fprintln(w, "</table>")
+
+	fmt.Fprintln(w, "<h2>Debug Info</h2>")
+
+	fmt.Fprintln(w, "<pre>")
+	fmt.Fprintln(w, html.EscapeString(sockstats.DebugInfo()))
+	fmt.Fprintln(w, "</pre>")
 }
 
 type incomingFile struct {
@@ -1047,6 +1088,10 @@ func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.ps.rootDir == "" {
 		http.Error(w, errNoTaildrop.Error(), http.StatusInternalServerError)
+		return
+	}
+	if distro.Get() == distro.Unraid && !h.ps.directFileMode {
+		http.Error(w, "Taildrop folder not configured or accessible", http.StatusInternalServerError)
 		return
 	}
 	rawPath := r.URL.EscapedPath()
@@ -1193,12 +1238,9 @@ func (h *peerAPIHandler) handleServeMagicsock(w http.ResponseWriter, r *http.Req
 		http.Error(w, "denied; no debug access", http.StatusForbidden)
 		return
 	}
-	eng := h.ps.b.e
-	if ig, ok := eng.(wgengine.InternalsGetter); ok {
-		if _, mc, _, ok := ig.GetInternals(); ok {
-			mc.ServeHTTPDebug(w, r)
-			return
-		}
+	if mc, ok := h.ps.b.sys.MagicSock.GetOK(); ok {
+		mc.ServeHTTPDebug(w, r)
+		return
 	}
 	http.Error(w, "miswired", 500)
 }

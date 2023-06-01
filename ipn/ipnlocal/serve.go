@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"os"
 	"path"
-	pathpkg "path"
 	"strconv"
 	"strings"
 	"sync"
@@ -144,7 +143,7 @@ func (s *serveListener) Run() {
 }
 
 func (s *serveListener) shouldWarnAboutListenError(err error) bool {
-	if !s.b.e.GetLinkMonitor().InterfaceState().HasIP(s.ap.Addr()) {
+	if !s.b.sys.NetMon.Get().InterfaceState().HasIP(s.ap.Addr()) {
 		// Machine likely doesn't have IPv6 enabled (or the IP is still being
 		// assigned). No need to warn. Notably, WSL2 (Issue 6303).
 		return false
@@ -218,6 +217,11 @@ func (b *LocalBackend) SetServeConfig(config *ipn.ServeConfig) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	prefs := b.pm.CurrentPrefs()
+	if config.IsFunnelOn() && prefs.ShieldsUp() {
+		return errors.New("Unable to turn on Funnel while shields-up is enabled")
+	}
+
 	nm := b.netMap
 	if nm == nil {
 		return errors.New("netMap is nil")
@@ -281,9 +285,22 @@ func (b *LocalBackend) HandleIngressTCPConn(ingressPeer *tailcfg.Node, target ip
 		sendRST()
 		return
 	}
+	dport := uint16(port16)
+	if b.getTCPHandlerForFunnelFlow != nil {
+		handler := b.getTCPHandlerForFunnelFlow(srcAddr, dport)
+		if handler != nil {
+			c, ok := getConn()
+			if !ok {
+				b.logf("localbackend: getConn didn't complete from %v to port %v", srcAddr, dport)
+				return
+			}
+			handler(c)
+			return
+		}
+	}
 	// TODO(bradfitz): pass ingressPeer etc in context to HandleInterceptedTCPConn,
 	// extend serveHTTPContext or similar.
-	b.HandleInterceptedTCPConn(uint16(port16), srcAddr, getConn, sendRST)
+	b.HandleInterceptedTCPConn(dport, srcAddr, getConn, sendRST)
 }
 
 func (b *LocalBackend) HandleInterceptedTCPConn(dport uint16, srcAddr netip.AddrPort, getConn func() (net.Conn, bool), sendRST func()) {
@@ -402,19 +419,19 @@ func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, 
 	if h, ok := wsc.Handlers().GetOk(r.URL.Path); ok {
 		return h, r.URL.Path, true
 	}
-	path := path.Clean(r.URL.Path)
+	pth := path.Clean(r.URL.Path)
 	for {
-		withSlash := path + "/"
+		withSlash := pth + "/"
 		if h, ok := wsc.Handlers().GetOk(withSlash); ok {
 			return h, withSlash, true
 		}
-		if h, ok := wsc.Handlers().GetOk(path); ok {
-			return h, path, true
+		if h, ok := wsc.Handlers().GetOk(pth); ok {
+			return h, pth, true
 		}
-		if path == "/" {
+		if pth == "/" {
 			return z, "", false
 		}
-		path = pathpkg.Dir(path)
+		pth = path.Dir(pth)
 	}
 }
 
@@ -426,18 +443,26 @@ func (b *LocalBackend) proxyHandlerForBackend(backend string) (*httputil.Reverse
 	if err != nil {
 		return nil, fmt.Errorf("invalid url %s: %w", targetURL, err)
 	}
-	rp := httputil.NewSingleHostReverseProxy(u)
-	rp.Transport = &http.Transport{
-		DialContext: b.dialer.SystemDial,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: insecure,
+	rp := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(u)
+			r.Out.Host = r.In.Host
+			if c, ok := r.Out.Context().Value(serveHTTPContextKey{}).(*serveHTTPContext); ok {
+				r.Out.Header.Set("X-Forwarded-For", c.SrcAddr.Addr().String())
+			}
 		},
-		// Values for the following parameters have been copied from http.DefaultTransport.
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		Transport: &http.Transport{
+			DialContext: b.dialer.SystemDial,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: insecure,
+			},
+			// Values for the following parameters have been copied from http.DefaultTransport.
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
 	}
 	return rp, nil
 }
@@ -463,7 +488,12 @@ func (b *LocalBackend) serveWebHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unknown proxy destination", http.StatusInternalServerError)
 			return
 		}
-		p.(http.Handler).ServeHTTP(w, r)
+		h := p.(http.Handler)
+		// Trim the mount point from the URL path before proxying. (#6571)
+		if r.URL.Path != "/" {
+			h = http.StripPrefix(strings.TrimSuffix(mountPoint, "/"), h)
+		}
+		h.ServeHTTP(w, r)
 		return
 	}
 

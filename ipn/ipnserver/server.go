@@ -24,7 +24,9 @@ import (
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/localapi"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
 	"tailscale.com/util/systemd"
@@ -35,7 +37,8 @@ import (
 type Server struct {
 	lb           atomic.Pointer[ipnlocal.LocalBackend]
 	logf         logger.Logf
-	backendLogID string
+	netMon       *netmon.Monitor // must be non-nil
+	backendLogID logid.PublicID
 	// resetOnZero is whether to call bs.Reset on transition from
 	// 1->0 active HTTP requests. That is, this is whether the backend is
 	// being run in "client mode" that requires an active GUI
@@ -196,7 +199,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer onDone()
 
 	if strings.HasPrefix(r.URL.Path, "/localapi/") {
-		lah := localapi.NewHandler(lb, s.logf, s.backendLogID)
+		lah := localapi.NewHandler(lb, s.logf, s.netMon, s.backendLogID)
 		lah.PermitRead, lah.PermitWrite = s.localAPIPermissions(ci)
 		lah.PermitCert = s.connCanFetchCerts(ci)
 		lah.ServeHTTP(w, r)
@@ -412,10 +415,14 @@ func (s *Server) addActiveHTTPRequest(req *http.Request, ci *ipnauth.ConnIdentit
 //
 // At some point, either before or after Run, the Server's SetLocalBackend
 // method must also be called before Server can do anything useful.
-func New(logf logger.Logf, logid string) *Server {
+func New(logf logger.Logf, logID logid.PublicID, netMon *netmon.Monitor) *Server {
+	if netMon == nil {
+		panic("nil netMon")
+	}
 	return &Server{
-		backendLogID: logid,
+		backendLogID: logID,
 		logf:         logf,
+		netMon:       netMon,
 		resetOnZero:  envknob.GOOS() == "windows",
 	}
 }

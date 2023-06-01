@@ -20,8 +20,9 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/winutil"
-	"tailscale.com/version"
 )
+
+var errAlreadyMigrated = errors.New("profile migration already completed")
 
 // profileManager is a wrapper around a StateStore that manages
 // multiple profiles and the current profile.
@@ -66,7 +67,13 @@ func (pm *profileManager) SetCurrentUserID(uid ipn.WindowsUserID) error {
 	// the selected profile for the current user.
 	b, err := pm.store.ReadState(ipn.CurrentProfileKey(string(uid)))
 	if err == ipn.ErrStateNotExist || len(b) == 0 {
-		pm.NewProfile()
+		if runtime.GOOS == "windows" {
+			if err := pm.migrateFromLegacyPrefs(); err != nil && !errors.Is(err, errAlreadyMigrated) {
+				return err
+			}
+		} else {
+			pm.NewProfile()
+		}
 		return nil
 	}
 
@@ -424,12 +431,7 @@ var defaultPrefs = func() ipn.PrefsView {
 	prefs.WantRunning = false
 
 	prefs.ControlURL = winutil.GetPolicyString("LoginURL", "")
-
-	if exitNode := winutil.GetPolicyString("ExitNodeIP", ""); exitNode != "" {
-		if ip, err := netip.ParseAddr(exitNode); err == nil {
-			prefs.ExitNodeIP = ip
-		}
-	}
+	prefs.ExitNodeIP = resolveExitNodeIP(netip.Addr{})
 
 	// Allow Incoming (used by the UI) is the negation of ShieldsUp (used by the
 	// backend), so this has to convert between the two conventions.
@@ -438,6 +440,16 @@ var defaultPrefs = func() ipn.PrefsView {
 
 	return prefs.View()
 }()
+
+func resolveExitNodeIP(defIP netip.Addr) (ret netip.Addr) {
+	ret = defIP
+	if exitNode := winutil.GetPolicyString("ExitNodeIP", ""); exitNode != "" {
+		if ip, err := netip.ParseAddr(exitNode); err == nil {
+			ret = ip
+		}
+	}
+	return ret
+}
 
 // Store returns the StateStore used by the ProfileManager.
 func (pm *profileManager) Store() ipn.StateStore {
@@ -534,7 +546,14 @@ func newProfileManagerWithGOOS(store ipn.StateStore, logf logger.Logf, goos stri
 		if err := pm.setPrefsLocked(prefs); err != nil {
 			return nil, err
 		}
-	} else if len(knownProfiles) == 0 && goos != "windows" {
+		// Most platform behavior is controlled by the goos parameter, however
+		// some behavior is implied by build tag and fails when run on Windows,
+		// so we explicitly avoid that behavior when running on Windows.
+		// Specifically this reaches down into legacy preference loading that is
+		// specialized by profiles_windows.go and fails in tests on an invalid
+		// uid passed in from the unix tests. The uid's used for Windows tests
+		// and runtime must be valid Windows security identifier structures.
+	} else if len(knownProfiles) == 0 && goos != "windows" && runtime.GOOS != "windows" {
 		// No known profiles, try a migration.
 		if err := pm.migrateFromLegacyPrefs(); err != nil {
 			return nil, err
@@ -549,27 +568,16 @@ func newProfileManagerWithGOOS(store ipn.StateStore, logf logger.Logf, goos stri
 func (pm *profileManager) migrateFromLegacyPrefs() error {
 	metricMigration.Add(1)
 	pm.NewProfile()
-	k := ipn.LegacyGlobalDaemonStateKey
-	switch {
-	case runtime.GOOS == "ios":
-		k = "ipn-go-bridge"
-	case version.IsSandboxedMacOS():
-		k = "ipn-go-bridge"
-	case runtime.GOOS == "android":
-		k = "ipn-android"
-	}
-	prefs, err := pm.loadSavedPrefs(k)
+	sentinel, prefs, err := pm.loadLegacyPrefs()
 	if err != nil {
 		metricMigrationError.Add(1)
-		return fmt.Errorf("calling ReadState on state store: %w", err)
+		return fmt.Errorf("load legacy prefs: %w", err)
 	}
-	pm.logf("migrating %q profile to new format", k)
 	if err := pm.SetPrefs(prefs); err != nil {
 		metricMigrationError.Add(1)
 		return fmt.Errorf("migrating _daemon profile: %w", err)
 	}
-	// Do not delete the old state key, as we may be downgraded to an
-	// older version that still relies on it.
+	pm.completeMigration(sentinel)
 	metricMigrationSuccess.Add(1)
 	return nil
 }

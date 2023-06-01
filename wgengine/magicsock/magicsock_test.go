@@ -18,10 +18,12 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -31,6 +33,10 @@ import (
 	"github.com/tailscale/wireguard-go/tun/tuntest"
 	"go4.org/mem"
 	"golang.org/x/exp/maps"
+	"golang.org/x/exp/slices"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
@@ -38,16 +44,20 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/connstats"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/net/packet"
+	"tailscale.com/net/ping"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/natlab"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netlogtype"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/racebuild"
 	"tailscale.com/wgengine/filter"
@@ -199,6 +209,7 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 }
 
 func (s *magicStack) Reconfig(cfg *wgcfg.Config) error {
+	s.tsTun.SetWGConfig(cfg)
 	s.wgLogger.SetPeers(cfg.Peers)
 	return wgcfg.ReconfigDevice(s.dev, cfg, s.conn.logf)
 }
@@ -370,8 +381,9 @@ func TestNewConn(t *testing.T) {
 		sizes := make([]int, 1)
 		eps := make([]wgconn.Endpoint, 1)
 		pkts[0] = make([]byte, 64<<10)
+		receiveIPv4 := conn.receiveIPv4()
 		for {
-			_, err := conn.receiveIPv4(pkts, sizes, eps)
+			_, err := receiveIPv4(pkts, sizes, eps)
 			if err != nil {
 				return
 			}
@@ -385,6 +397,7 @@ collectEndpoints:
 	for {
 		select {
 		case ep := <-epCh:
+			t.Logf("TestNewConn: got endpoint: %v", ep)
 			endpoints = append(endpoints, ep)
 			if strings.HasSuffix(ep, suffix) {
 				break collectEndpoints
@@ -1142,10 +1155,14 @@ func TestDiscoMessage(t *testing.T) {
 		Key:      key.NewNode().Public(),
 		DiscoKey: peer1Pub,
 	}
-	c.peerMap.upsertEndpoint(&endpoint{
+	ep := &endpoint{
 		publicKey: n.Key,
-		discoKey:  n.DiscoKey,
-	}, key.DiscoPublic{})
+	}
+	ep.disco.Store(&endpointDisco{
+		key:   n.DiscoKey,
+		short: n.DiscoKey.ShortString(),
+	})
+	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
 
 	const payload = "why hello"
 
@@ -1156,7 +1173,7 @@ func TestDiscoMessage(t *testing.T) {
 
 	box := peer1Priv.Shared(c.discoPrivate.Public()).Seal([]byte(payload))
 	pkt = append(pkt, box...)
-	got := c.handleDiscoMessage(pkt, netip.AddrPort{}, key.NodePublic{})
+	got := c.handleDiscoMessage(pkt, netip.AddrPort{}, key.NodePublic{}, discoRXPathUDP)
 	if !got {
 		t.Error("failed to open it")
 	}
@@ -1276,11 +1293,12 @@ func setUpReceiveFrom(tb testing.TB) (roundTrip func()) {
 	buffs[0] = make([]byte, 2<<10)
 	sizes := make([]int, 1)
 	eps := make([]wgconn.Endpoint, 1)
+	receiveIPv4 := conn.receiveIPv4()
 	return func() {
 		if _, err := sendConn.WriteTo(sendBuf, dstAddr); err != nil {
 			tb.Fatalf("WriteTo: %v", err)
 		}
-		n, err := conn.receiveIPv4(buffs, sizes, eps)
+		n, err := receiveIPv4(buffs, sizes, eps)
 		if err != nil {
 			tb.Fatal(err)
 		}
@@ -1457,8 +1475,12 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 	if ok && de.publicKey != nodeKey2 {
 		t.Fatalf("discoEndpoint public key = %q; want %q", de.publicKey, nodeKey2)
 	}
-	if de.discoKey != discoKey {
-		t.Errorf("discoKey = %v; want %v", de.discoKey, discoKey)
+	deDisco := de.disco.Load()
+	if deDisco == nil {
+		t.Fatalf("discoEndpoint disco is nil")
+	}
+	if deDisco.key != discoKey {
+		t.Errorf("discoKey = %v; want %v", deDisco.key, discoKey)
 	}
 	if _, ok := conn.peerMap.endpointForNodeKey(nodeKey1); ok {
 		t.Errorf("didn't expect to find node for key1")
@@ -1501,8 +1523,9 @@ func TestRebindStress(t *testing.T) {
 		sizes := make([]int, 1)
 		eps := make([]wgconn.Endpoint, 1)
 		buffs[0] = make([]byte, 1500)
+		receiveIPv4 := conn.receiveIPv4()
 		for {
-			_, err := conn.receiveIPv4(buffs, sizes, eps)
+			_, err := receiveIPv4(buffs, sizes, eps)
 			if ctx.Err() != nil {
 				errc <- nil
 				return
@@ -1615,8 +1638,12 @@ func TestBetterAddr(t *testing.T) {
 		{a: zero, b: zero, want: false},
 		{a: al("10.0.0.2:123", 5*ms), b: zero, want: true},
 		{a: zero, b: al("10.0.0.2:123", 5*ms), want: false},
-		{a: al("10.0.0.2:123", 5*ms), b: al("1.2.3.4:555", 6*ms), want: true},
+		{a: al("10.0.0.2:123", 5*ms), b: al("1.2.3.4:555", 10*ms), want: true},
 		{a: al("10.0.0.2:123", 5*ms), b: al("10.0.0.2:123", 10*ms), want: false}, // same IPPort
+
+		// Don't prefer b to a if it's not substantially better.
+		{a: al("10.0.0.2:123", 100*ms), b: al("1.2.3.4:555", 101*ms), want: false},
+		{a: al("10.0.0.2:123", 100*ms), b: al("1.2.3.4:555", 103*ms), want: true},
 
 		// Prefer IPv6 if roughly equivalent:
 		{
@@ -1786,7 +1813,7 @@ func TestBlockForeverConnUnblocks(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		defer close(done)
-		_, _, err := c.ReadFrom(make([]byte, 1))
+		_, _, err := c.ReadFromUDPAddrPort(make([]byte, 1))
 		done <- err
 	}()
 	time.Sleep(50 * time.Millisecond) // give ReadFrom time to get blocked
@@ -1832,8 +1859,8 @@ func TestRebindingUDPConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer realConn.Close()
-	c.setConnLocked(realConn.(nettype.PacketConn), "udp4")
-	c.setConnLocked(newBlockForeverConn(), "")
+	c.setConnLocked(realConn.(nettype.PacketConn), "udp4", 1)
+	c.setConnLocked(newBlockForeverConn(), "", 1)
 }
 
 // https://github.com/tailscale/tailscale/issues/6680: don't ignore
@@ -1850,6 +1877,985 @@ func TestSetNetworkMapWithNoPeers(t *testing.T) {
 		t.Logf("ptr %d: %p", i, nm)
 		if c.netMap != nm {
 			t.Fatalf("call %d: didn't store netmap", i)
+		}
+	}
+}
+
+func TestBufferedDerpWritesBeforeDrop(t *testing.T) {
+	vv := bufferedDerpWritesBeforeDrop()
+	if vv < 32 {
+		t.Fatalf("got bufferedDerpWritesBeforeDrop=%d, which is < 32", vv)
+	}
+	t.Logf("bufferedDerpWritesBeforeDrop = %d", vv)
+}
+
+func setGSOSize(control *[]byte, gsoSize uint16) {
+	*control = (*control)[:cap(*control)]
+	binary.LittleEndian.PutUint16(*control, gsoSize)
+}
+
+func getGSOSize(control []byte) (int, error) {
+	if len(control) < 2 {
+		return 0, nil
+	}
+	return int(binary.LittleEndian.Uint16(control)), nil
+}
+
+func Test_batchingUDPConn_splitCoalescedMessages(t *testing.T) {
+	c := &batchingUDPConn{
+		setGSOSizeInControl:   setGSOSize,
+		getGSOSizeFromControl: getGSOSize,
+	}
+
+	newMsg := func(n, gso int) ipv6.Message {
+		msg := ipv6.Message{
+			Buffers: [][]byte{make([]byte, 1024)},
+			N:       n,
+			OOB:     make([]byte, 2),
+		}
+		binary.LittleEndian.PutUint16(msg.OOB, uint16(gso))
+		if gso > 0 {
+			msg.NN = 2
+		}
+		return msg
+	}
+
+	cases := []struct {
+		name        string
+		msgs        []ipv6.Message
+		firstMsgAt  int
+		wantNumEval int
+		wantMsgLens []int
+		wantErr     bool
+	}{
+		{
+			name: "second last split last empty",
+			msgs: []ipv6.Message{
+				newMsg(0, 0),
+				newMsg(0, 0),
+				newMsg(3, 1),
+				newMsg(0, 0),
+			},
+			firstMsgAt:  2,
+			wantNumEval: 3,
+			wantMsgLens: []int{1, 1, 1, 0},
+			wantErr:     false,
+		},
+		{
+			name: "second last no split last empty",
+			msgs: []ipv6.Message{
+				newMsg(0, 0),
+				newMsg(0, 0),
+				newMsg(1, 0),
+				newMsg(0, 0),
+			},
+			firstMsgAt:  2,
+			wantNumEval: 1,
+			wantMsgLens: []int{1, 0, 0, 0},
+			wantErr:     false,
+		},
+		{
+			name: "second last no split last no split",
+			msgs: []ipv6.Message{
+				newMsg(0, 0),
+				newMsg(0, 0),
+				newMsg(1, 0),
+				newMsg(1, 0),
+			},
+			firstMsgAt:  2,
+			wantNumEval: 2,
+			wantMsgLens: []int{1, 1, 0, 0},
+			wantErr:     false,
+		},
+		{
+			name: "second last no split last split",
+			msgs: []ipv6.Message{
+				newMsg(0, 0),
+				newMsg(0, 0),
+				newMsg(1, 0),
+				newMsg(3, 1),
+			},
+			firstMsgAt:  2,
+			wantNumEval: 4,
+			wantMsgLens: []int{1, 1, 1, 1},
+			wantErr:     false,
+		},
+		{
+			name: "second last split last split",
+			msgs: []ipv6.Message{
+				newMsg(0, 0),
+				newMsg(0, 0),
+				newMsg(2, 1),
+				newMsg(2, 1),
+			},
+			firstMsgAt:  2,
+			wantNumEval: 4,
+			wantMsgLens: []int{1, 1, 1, 1},
+			wantErr:     false,
+		},
+		{
+			name: "second last no split last split overflow",
+			msgs: []ipv6.Message{
+				newMsg(0, 0),
+				newMsg(0, 0),
+				newMsg(1, 0),
+				newMsg(4, 1),
+			},
+			firstMsgAt:  2,
+			wantNumEval: 4,
+			wantMsgLens: []int{1, 1, 1, 1},
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := c.splitCoalescedMessages(tt.msgs, 2)
+			if err != nil && !tt.wantErr {
+				t.Fatalf("err: %v", err)
+			}
+			if got != tt.wantNumEval {
+				t.Fatalf("got to eval: %d want: %d", got, tt.wantNumEval)
+			}
+			for i, msg := range tt.msgs {
+				if msg.N != tt.wantMsgLens[i] {
+					t.Fatalf("msg[%d].N: %d want: %d", i, msg.N, tt.wantMsgLens[i])
+				}
+			}
+		})
+	}
+}
+
+func Test_batchingUDPConn_coalesceMessages(t *testing.T) {
+	c := &batchingUDPConn{
+		setGSOSizeInControl:   setGSOSize,
+		getGSOSizeFromControl: getGSOSize,
+	}
+
+	cases := []struct {
+		name     string
+		buffs    [][]byte
+		wantLens []int
+		wantGSO  []int
+	}{
+		{
+			name: "one message no coalesce",
+			buffs: [][]byte{
+				make([]byte, 1, 1),
+			},
+			wantLens: []int{1},
+			wantGSO:  []int{0},
+		},
+		{
+			name: "two messages equal len coalesce",
+			buffs: [][]byte{
+				make([]byte, 1, 2),
+				make([]byte, 1, 1),
+			},
+			wantLens: []int{2},
+			wantGSO:  []int{1},
+		},
+		{
+			name: "two messages unequal len coalesce",
+			buffs: [][]byte{
+				make([]byte, 2, 3),
+				make([]byte, 1, 1),
+			},
+			wantLens: []int{3},
+			wantGSO:  []int{2},
+		},
+		{
+			name: "three messages second unequal len coalesce",
+			buffs: [][]byte{
+				make([]byte, 2, 3),
+				make([]byte, 1, 1),
+				make([]byte, 2, 2),
+			},
+			wantLens: []int{3, 2},
+			wantGSO:  []int{2, 0},
+		},
+		{
+			name: "three messages limited cap coalesce",
+			buffs: [][]byte{
+				make([]byte, 2, 4),
+				make([]byte, 2, 2),
+				make([]byte, 2, 2),
+			},
+			wantLens: []int{4, 2},
+			wantGSO:  []int{2, 0},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			addr := &net.UDPAddr{
+				IP:   net.ParseIP("127.0.0.1"),
+				Port: 1,
+			}
+			msgs := make([]ipv6.Message, len(tt.buffs))
+			for i := range msgs {
+				msgs[i].Buffers = make([][]byte, 1)
+				msgs[i].OOB = make([]byte, 0, 2)
+			}
+			got := c.coalesceMessages(addr, tt.buffs, msgs)
+			if got != len(tt.wantLens) {
+				t.Fatalf("got len %d want: %d", got, len(tt.wantLens))
+			}
+			for i := 0; i < got; i++ {
+				if msgs[i].Addr != addr {
+					t.Errorf("msgs[%d].Addr != passed addr", i)
+				}
+				gotLen := len(msgs[i].Buffers[0])
+				if gotLen != tt.wantLens[i] {
+					t.Errorf("len(msgs[%d].Buffers[0]) %d != %d", i, gotLen, tt.wantLens[i])
+				}
+				gotGSO, err := getGSOSize(msgs[i].OOB)
+				if err != nil {
+					t.Fatalf("msgs[%d] getGSOSize err: %v", i, err)
+				}
+				if gotGSO != tt.wantGSO[i] {
+					t.Errorf("msgs[%d] gsoSize %d != %d", i, gotGSO, tt.wantGSO[i])
+				}
+			}
+		})
+	}
+}
+
+// newWireguard starts up a new wireguard-go device attached to a test tun, and
+// returns the device, tun and endpoint port. To add peers call device.IpcSet with UAPI instructions.
+func newWireguard(t *testing.T, uapi string, aips []netip.Prefix) (*device.Device, *tuntest.ChannelTUN, uint16) {
+	wgtun := tuntest.NewChannelTUN()
+	wglogf := func(f string, args ...any) {
+		t.Logf("wg-go: "+f, args...)
+	}
+	wglog := device.Logger{
+		Verbosef: func(string, ...any) {},
+		Errorf:   wglogf,
+	}
+	wgdev := wgcfg.NewDevice(wgtun.TUN(), wgconn.NewDefaultBind(), &wglog)
+
+	if err := wgdev.IpcSet(uapi); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wgdev.Up(); err != nil {
+		t.Fatal(err)
+	}
+
+	var port uint16
+	s, err := wgdev.IpcGet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		k, v, _ := strings.Cut(line, "=")
+		if k == "listen_port" {
+			p, err := strconv.ParseUint(v, 10, 16)
+			if err != nil {
+				panic(err)
+			}
+			port = uint16(p)
+			break
+		}
+	}
+
+	return wgdev, wgtun, port
+}
+
+func TestIsWireGuardOnlyPeer(t *testing.T) {
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	tskey := key.NewNode()
+	tsaip := netip.MustParsePrefix("100.111.222.111/32")
+
+	wgkey := key.NewNode()
+	wgaip := netip.MustParsePrefix("100.222.111.222/32")
+
+	uapi := fmt.Sprintf("private_key=%s\npublic_key=%s\nallowed_ip=%s\n\n",
+		wgkey.UntypedHexString(), tskey.Public().UntypedHexString(), tsaip.String())
+	wgdev, wgtun, port := newWireguard(t, uapi, []netip.Prefix{wgaip})
+	defer wgdev.Close()
+	wgEp := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	m := newMagicStackWithKey(t, t.Logf, localhostListener{}, derpMap, tskey)
+	defer m.Close()
+
+	nm := &netmap.NetworkMap{
+		Name:       "ts",
+		PrivateKey: m.privateKey,
+		NodeKey:    m.privateKey.Public(),
+		Addresses:  []netip.Prefix{tsaip},
+		Peers: []*tailcfg.Node{
+			{
+				Key:             wgkey.Public(),
+				Endpoints:       []string{wgEp.String()},
+				IsWireGuardOnly: true,
+				Addresses:       []netip.Prefix{wgaip},
+				AllowedIPs:      []netip.Prefix{wgaip},
+			},
+		},
+	}
+	m.conn.SetNetworkMap(nm)
+
+	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSingleHosts|netmap.AllowSubnetRoutes, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Reconfig(cfg)
+
+	pbuf := tuntest.Ping(wgaip.Addr(), tsaip.Addr())
+	m.tun.Outbound <- pbuf
+
+	select {
+	case p := <-wgtun.Inbound:
+		if !bytes.Equal(p, pbuf) {
+			t.Errorf("got unexpected packet: %x", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no packet after 1s")
+	}
+}
+
+func TestIsWireGuardOnlyPeerWithMasquerade(t *testing.T) {
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	tskey := key.NewNode()
+	tsaip := netip.MustParsePrefix("100.111.222.111/32")
+
+	wgkey := key.NewNode()
+	wgaip := netip.MustParsePrefix("10.64.0.1/32")
+
+	// the ip that the wireguard peer has in allowed ips and expects as a masq source
+	masqip := netip.MustParsePrefix("10.64.0.2/32")
+
+	uapi := fmt.Sprintf("private_key=%s\npublic_key=%s\nallowed_ip=%s\n\n",
+		wgkey.UntypedHexString(), tskey.Public().UntypedHexString(), masqip.String())
+	wgdev, wgtun, port := newWireguard(t, uapi, []netip.Prefix{wgaip})
+	defer wgdev.Close()
+	wgEp := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	m := newMagicStackWithKey(t, t.Logf, localhostListener{}, derpMap, tskey)
+	defer m.Close()
+
+	nm := &netmap.NetworkMap{
+		Name:       "ts",
+		PrivateKey: m.privateKey,
+		NodeKey:    m.privateKey.Public(),
+		Addresses:  []netip.Prefix{tsaip},
+		Peers: []*tailcfg.Node{
+			{
+				Key:                           wgkey.Public(),
+				Endpoints:                     []string{wgEp.String()},
+				IsWireGuardOnly:               true,
+				Addresses:                     []netip.Prefix{wgaip},
+				AllowedIPs:                    []netip.Prefix{wgaip},
+				SelfNodeV4MasqAddrForThisPeer: ptr.To(masqip.Addr()),
+			},
+		},
+	}
+	m.conn.SetNetworkMap(nm)
+
+	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSingleHosts|netmap.AllowSubnetRoutes, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Reconfig(cfg)
+
+	pbuf := tuntest.Ping(wgaip.Addr(), tsaip.Addr())
+	m.tun.Outbound <- pbuf
+
+	select {
+	case p := <-wgtun.Inbound:
+
+		// TODO(raggi): move to a bytes.Equal based test later, once
+		// tuntest.Ping produces correct checksums!
+
+		var pkt packet.Parsed
+		pkt.Decode(p)
+		if pkt.ICMP4Header().Type != packet.ICMP4EchoRequest {
+			t.Fatalf("unexpected packet: %x", p)
+		}
+		if pkt.Src.Addr() != masqip.Addr() {
+			t.Fatalf("bad source IP, got %s, want %s", pkt.Src.Addr(), masqip.Addr())
+		}
+		if pkt.Dst.Addr() != wgaip.Addr() {
+			t.Fatalf("bad source IP, got %s, want %s", pkt.Src.Addr(), masqip.Addr())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no packet after 1s")
+	}
+}
+
+func TestEndpointTracker(t *testing.T) {
+	local := tailcfg.Endpoint{
+		Addr: netip.MustParseAddrPort("192.168.1.1:12345"),
+		Type: tailcfg.EndpointLocal,
+	}
+
+	stun4_1 := tailcfg.Endpoint{
+		Addr: netip.MustParseAddrPort("1.2.3.4:12345"),
+		Type: tailcfg.EndpointSTUN,
+	}
+	stun4_2 := tailcfg.Endpoint{
+		Addr: netip.MustParseAddrPort("5.6.7.8:12345"),
+		Type: tailcfg.EndpointSTUN,
+	}
+
+	stun6_1 := tailcfg.Endpoint{
+		Addr: netip.MustParseAddrPort("[2a09:8280:1::1111]:12345"),
+		Type: tailcfg.EndpointSTUN,
+	}
+	stun6_2 := tailcfg.Endpoint{
+		Addr: netip.MustParseAddrPort("[2a09:8280:1::2222]:12345"),
+		Type: tailcfg.EndpointSTUN,
+	}
+
+	start := time.Unix(1681503440, 0)
+
+	steps := []struct {
+		name string
+		now  time.Time
+		eps  []tailcfg.Endpoint
+		want []tailcfg.Endpoint
+	}{
+		{
+			name: "initial endpoints",
+			now:  start,
+			eps:  []tailcfg.Endpoint{local, stun4_1, stun6_1},
+			want: []tailcfg.Endpoint{local, stun4_1, stun6_1},
+		},
+		{
+			name: "no change",
+			now:  start.Add(1 * time.Minute),
+			eps:  []tailcfg.Endpoint{local, stun4_1, stun6_1},
+			want: []tailcfg.Endpoint{local, stun4_1, stun6_1},
+		},
+		{
+			name: "missing stun4",
+			now:  start.Add(2 * time.Minute),
+			eps:  []tailcfg.Endpoint{local, stun6_1},
+			want: []tailcfg.Endpoint{local, stun4_1, stun6_1},
+		},
+		{
+			name: "missing stun6",
+			now:  start.Add(3 * time.Minute),
+			eps:  []tailcfg.Endpoint{local, stun4_1},
+			want: []tailcfg.Endpoint{local, stun4_1, stun6_1},
+		},
+		{
+			name: "multiple STUN addresses within timeout",
+			now:  start.Add(4 * time.Minute),
+			eps:  []tailcfg.Endpoint{local, stun4_2, stun6_2},
+			want: []tailcfg.Endpoint{local, stun4_1, stun4_2, stun6_1, stun6_2},
+		},
+		{
+			name: "endpoint extended",
+			now:  start.Add(3*time.Minute + endpointTrackerLifetime - 1),
+			eps:  []tailcfg.Endpoint{local},
+			want: []tailcfg.Endpoint{
+				local, stun4_2, stun6_2,
+				// stun4_1 had its lifetime extended by the
+				// "missing stun6" test above to that start
+				// time plus the lifetime, while stun6 should
+				// have expired a minute sooner. It should thus
+				// be in this returned list.
+				stun4_1,
+			},
+		},
+		{
+			name: "after timeout",
+			now:  start.Add(4*time.Minute + endpointTrackerLifetime + 1),
+			eps:  []tailcfg.Endpoint{local, stun4_2, stun6_2},
+			want: []tailcfg.Endpoint{local, stun4_2, stun6_2},
+		},
+		{
+			name: "after timeout still caches",
+			now:  start.Add(4*time.Minute + endpointTrackerLifetime + time.Minute),
+			eps:  []tailcfg.Endpoint{local},
+			want: []tailcfg.Endpoint{local, stun4_2, stun6_2},
+		},
+	}
+
+	var et endpointTracker
+	for _, tt := range steps {
+		t.Logf("STEP: %s", tt.name)
+
+		got := et.update(tt.now, tt.eps)
+
+		// Sort both arrays for comparison
+		slices.SortFunc(got, func(a, b tailcfg.Endpoint) bool {
+			return a.Addr.String() < b.Addr.String()
+		})
+		slices.SortFunc(tt.want, func(a, b tailcfg.Endpoint) bool {
+			return a.Addr.String() < b.Addr.String()
+		})
+
+		if !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("endpoints mismatch\ngot: %+v\nwant: %+v", got, tt.want)
+		}
+	}
+}
+
+// applyNetworkMap is a test helper that sets the network map and
+// configures WG.
+func applyNetworkMap(t *testing.T, m *magicStack, nm *netmap.NetworkMap) {
+	t.Helper()
+	m.conn.SetNetworkMap(nm)
+	// Make sure we can't use v6 to avoid test failures.
+	m.conn.noV6.Store(true)
+
+	// Turn the network map into a wireguard config (for the tailscale internal wireguard device).
+	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSingleHosts|netmap.AllowSubnetRoutes, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Apply the wireguard config to the tailscale internal wireguard device.
+	if err := m.Reconfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIsWireGuardOnlyPickEndpointByPing(t *testing.T) {
+	t.Skip("This test is flaky; see https://github.com/tailscale/tailscale/issues/8037")
+
+	clock := &tstest.Clock{}
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	// Create a TS client.
+	tskey := key.NewNode()
+	tsaip := netip.MustParsePrefix("100.111.222.111/32")
+
+	// Create a WireGuard only client.
+	wgkey := key.NewNode()
+	wgaip := netip.MustParsePrefix("100.222.111.222/32")
+
+	uapi := fmt.Sprintf("private_key=%s\npublic_key=%s\nallowed_ip=%s\n\n",
+		wgkey.UntypedHexString(), tskey.Public().UntypedHexString(), tsaip.String())
+
+	wgdev, wgtun, port := newWireguard(t, uapi, []netip.Prefix{wgaip})
+	defer wgdev.Close()
+	wgEp := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+	wgEp2 := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.2"), port)
+
+	m := newMagicStackWithKey(t, t.Logf, localhostListener{}, derpMap, tskey)
+	defer m.Close()
+
+	pr := newPingResponder(t)
+	// Get a destination address which includes a port, so that UDP packets flow
+	// to the correct place, the mockPinger will use this to direct port-less
+	// pings to this place.
+	pingDest := pr.LocalAddr()
+
+	// Create and start the pinger that is used for the
+	// wireguard only endpoint pings
+	p, closeP := mockPinger(t, clock, pingDest)
+	defer closeP()
+	m.conn.wgPinger.Set(p)
+
+	// Create an IPv6 endpoint which should not receive any traffic.
+	v6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("::"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	badEpRecv := make(chan []byte)
+	go func() {
+		defer v6.Close()
+		for {
+			b := make([]byte, 1500)
+			n, _, err := v6.ReadFrom(b)
+			if err != nil {
+				close(badEpRecv)
+				return
+			}
+			badEpRecv <- b[:n]
+		}
+	}()
+	wgEpV6 := netip.MustParseAddrPort(v6.LocalAddr().String())
+
+	nm := &netmap.NetworkMap{
+		Name:       "ts",
+		PrivateKey: m.privateKey,
+		NodeKey:    m.privateKey.Public(),
+		Addresses:  []netip.Prefix{tsaip},
+		Peers: []*tailcfg.Node{
+			{
+				Key:             wgkey.Public(),
+				Endpoints:       []string{wgEp.String(), wgEp2.String(), wgEpV6.String()},
+				IsWireGuardOnly: true,
+				Addresses:       []netip.Prefix{wgaip},
+				AllowedIPs:      []netip.Prefix{wgaip},
+			},
+		},
+	}
+
+	applyNetworkMap(t, m, nm)
+
+	buf := tuntest.Ping(wgaip.Addr(), tsaip.Addr())
+	m.tun.Outbound <- buf
+
+	select {
+	case p := <-wgtun.Inbound:
+		if !bytes.Equal(p, buf) {
+			t.Errorf("got unexpected packet: %x", p)
+		}
+	case <-badEpRecv:
+		t.Fatal("got packet on bad endpoint")
+	case <-time.After(5 * time.Second):
+		t.Fatal("no packet after 1s")
+	}
+
+	pi, ok := m.conn.peerMap.byNodeKey[wgkey.Public()]
+	if !ok {
+		t.Fatal("wgkey doesn't exist in peer map")
+	}
+
+	// Check that we got a valid address set on the first send - this
+	// will be randomly selected, but because we have noV6 set to true,
+	// it will be the IPv4 address.
+	if !pi.ep.bestAddr.Addr().IsValid() {
+		t.Fatal("bestaddr was nil")
+	}
+
+	if pi.ep.trustBestAddrUntil.Before(mono.Now().Add(14 * time.Second)) {
+		t.Errorf("trustBestAddrUntil time wasn't set to 15 seconds in the future: got %v", pi.ep.trustBestAddrUntil)
+	}
+
+	for ipp, state := range pi.ep.endpointState {
+		if ipp == wgEp {
+			if len(state.recentPongs) != 1 {
+				t.Errorf("IPv4 address did not have a recentPong entry: got %v, want %v", len(state.recentPongs), 1)
+			}
+			// Set the latency extremely low so we choose this endpoint during the next
+			// addrForSendLocked call.
+			state.recentPongs[state.recentPong].latency = time.Nanosecond
+		}
+
+		if ipp == wgEp2 {
+			if len(state.recentPongs) != 1 {
+				t.Errorf("IPv4 address did not have a recentPong entry: got %v, want %v", len(state.recentPongs), 1)
+			}
+			// Set the latency extremely high so we dont choose endpoint during the next
+			// addrForSendLocked call.
+			state.recentPongs[state.recentPong].latency = time.Second
+		}
+
+		if ipp == wgEpV6 && len(state.recentPongs) != 0 {
+			t.Fatal("IPv6 should not have recentPong: IPv6 is not useable")
+		}
+	}
+
+	// Set trustBestAddrUnitl to now, so addrForSendLocked goes through the
+	// latency selection flow.
+	pi.ep.trustBestAddrUntil = mono.Now().Add(-time.Second)
+
+	buf = tuntest.Ping(wgaip.Addr(), tsaip.Addr())
+	m.tun.Outbound <- buf
+
+	select {
+	case p := <-wgtun.Inbound:
+		if !bytes.Equal(p, buf) {
+			t.Errorf("got unexpected packet: %x", p)
+		}
+	case <-badEpRecv:
+		t.Fatal("got packet on bad endpoint")
+	case <-time.After(5 * time.Second):
+		t.Fatal("no packet after 1s")
+	}
+
+	// Check that we have responded to a WireGuard only ping twice.
+	if pr.responseCount != 2 {
+		t.Fatal("pingresponder response count was not 2", pr.responseCount)
+	}
+
+	pi, ok = m.conn.peerMap.byNodeKey[wgkey.Public()]
+	if !ok {
+		t.Fatal("wgkey doesn't exist in peer map")
+	}
+
+	if !pi.ep.bestAddr.Addr().IsValid() {
+		t.Error("no bestAddr address was set")
+	}
+
+	if pi.ep.bestAddr.Addr() != wgEp.Addr() {
+		t.Errorf("bestAddr was not set to the expected IPv4 address: got %v, want %v", pi.ep.bestAddr.Addr().String(), wgEp.Addr())
+	}
+
+	if pi.ep.trustBestAddrUntil.IsZero() {
+		t.Fatal("trustBestAddrUntil was not set")
+	}
+
+	if pi.ep.trustBestAddrUntil.Before(mono.Now().Add(55 * time.Minute)) {
+		// Set to 55 minutes incase of sloooow tests.
+		t.Errorf("trustBestAddrUntil time wasn't set to an hour in the future: got %v", pi.ep.trustBestAddrUntil)
+	}
+}
+
+// udpingPacketConn will convert potentially ICMP destination addrs to UDP
+// destination addrs in WriteTo so that a test that is intending to send ICMP
+// traffic will instead send UDP traffic, without the higher level Pinger being
+// aware of this difference.
+type udpingPacketConn struct {
+	net.PacketConn
+	// destPort will be configured by the test to be the peer expected to respond to a ping.
+	destPort uint16
+}
+
+func (u *udpingPacketConn) WriteTo(body []byte, dest net.Addr) (int, error) {
+	switch d := dest.(type) {
+	case *net.IPAddr:
+		udpAddr := &net.UDPAddr{
+			IP:   d.IP,
+			Port: int(u.destPort),
+			Zone: d.Zone,
+		}
+		return u.PacketConn.WriteTo(body, udpAddr)
+	}
+	return 0, fmt.Errorf("unimplemented udpingPacketConn for %T", dest)
+}
+
+type mockListenPacketer struct {
+	conn4 net.PacketConn
+	conn6 net.PacketConn
+}
+
+func (mlp *mockListenPacketer) ListenPacket(ctx context.Context, typ string, addr string) (net.PacketConn, error) {
+	switch typ {
+	case "ip4:icmp":
+		return mlp.conn4, nil
+	case "ip6:icmp":
+		return mlp.conn6, nil
+	}
+	return nil, fmt.Errorf("unimplemented ListenPacketForTesting for %s", typ)
+}
+
+func mockPinger(t *testing.T, clock *tstest.Clock, dest net.Addr) (*ping.Pinger, func()) {
+	ctx := context.Background()
+
+	dIPP := netip.MustParseAddrPort(dest.String())
+	// In tests, we use UDP so that we can test without being root; this
+	// doesn't matter because we mock out the ICMP reply below to be a real
+	// ICMP echo reply packet.
+	conn4, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket: %v", err)
+	}
+	conn6, err := net.ListenPacket("udp6", "[::]:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket: %v", err)
+	}
+
+	conn4 = &udpingPacketConn{
+		PacketConn: conn4,
+		destPort:   dIPP.Port(),
+	}
+
+	conn6 = &udpingPacketConn{
+		PacketConn: conn6,
+		destPort:   dIPP.Port(),
+	}
+
+	p := ping.New(ctx, t.Logf, &mockListenPacketer{conn4: conn4, conn6: conn6})
+
+	done := func() {
+		if err := p.Close(); err != nil {
+			t.Errorf("error on close: %v", err)
+		}
+	}
+
+	return p, done
+}
+
+type pingResponder struct {
+	net.PacketConn
+	running       atomic.Bool
+	responseCount int
+}
+
+func (p *pingResponder) start() {
+	buf := make([]byte, 1500)
+	for p.running.Load() {
+		n, addr, err := p.PacketConn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+
+		m, err := icmp.ParseMessage(1, buf[:n])
+		if err != nil {
+			panic("got a non-ICMP message:" + fmt.Sprintf("%x", m))
+		}
+
+		r := icmp.Message{
+			Type: ipv4.ICMPTypeEchoReply,
+			Code: m.Code,
+			Body: m.Body,
+		}
+
+		b, err := r.Marshal(nil)
+		if err != nil {
+			panic(err)
+		}
+
+		if _, err := p.PacketConn.WriteTo(b, addr); err != nil {
+			panic(err)
+		}
+		p.responseCount++
+	}
+}
+
+func (p *pingResponder) stop() {
+	p.running.Store(false)
+	p.Close()
+}
+
+func newPingResponder(t *testing.T) *pingResponder {
+	t.Helper()
+	// global binds should be both IPv4 and IPv6 (if our test platforms don't,
+	// we might need to bind two sockets instead)
+	conn, err := net.ListenPacket("udp", ":")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := &pingResponder{PacketConn: conn}
+	pr.running.Store(true)
+	go pr.start()
+	t.Cleanup(pr.stop)
+	return pr
+}
+
+func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
+	testTime := mono.Now()
+
+	type endpointDetails struct {
+		addrPort netip.AddrPort
+		latency  time.Duration
+	}
+
+	wgTests := []struct {
+		name       string
+		noV4       bool
+		noV6       bool
+		sendWGPing bool
+		ep         []endpointDetails
+		want       netip.AddrPort
+	}{
+		{
+			name:       "choose lowest latency for useable IPv4 and IPv6",
+			sendWGPing: true,
+			ep: []endpointDetails{
+				{
+					addrPort: netip.MustParseAddrPort("1.1.1.1:111"),
+					latency:  100 * time.Millisecond,
+				},
+				{
+					addrPort: netip.MustParseAddrPort("[2345:0425:2CA1:0000:0000:0567:5673:23b5]:222"),
+					latency:  10 * time.Millisecond,
+				},
+			},
+			want: netip.MustParseAddrPort("[2345:0425:2CA1:0000:0000:0567:5673:23b5]:222"),
+		},
+		{
+			name:       "choose IPv4 when IPv6 is not useable",
+			sendWGPing: false,
+			noV6:       true,
+			ep: []endpointDetails{
+				{
+					addrPort: netip.MustParseAddrPort("1.1.1.1:111"),
+					latency:  100 * time.Millisecond,
+				},
+				{
+					addrPort: netip.MustParseAddrPort("[1::1]:567"),
+				},
+			},
+			want: netip.MustParseAddrPort("1.1.1.1:111"),
+		},
+		{
+			name:       "choose IPv6 when IPv4 is not useable",
+			sendWGPing: false,
+			noV4:       true,
+			ep: []endpointDetails{
+				{
+					addrPort: netip.MustParseAddrPort("1.1.1.1:111"),
+				},
+				{
+					addrPort: netip.MustParseAddrPort("[1::1]:567"),
+					latency:  100 * time.Millisecond,
+				},
+			},
+			want: netip.MustParseAddrPort("[1::1]:567"),
+		},
+		{
+			name:       "choose IPv6 address when latency is the same for v4 and v6",
+			sendWGPing: true,
+			ep: []endpointDetails{
+				{
+					addrPort: netip.MustParseAddrPort("1.1.1.1:111"),
+					latency:  100 * time.Millisecond,
+				},
+				{
+					addrPort: netip.MustParseAddrPort("[1::1]:567"),
+					latency:  100 * time.Millisecond,
+				},
+			},
+			want: netip.MustParseAddrPort("[1::1]:567"),
+		},
+	}
+
+	for _, test := range wgTests {
+		endpoint := &endpoint{
+			isWireguardOnly: true,
+			endpointState:   map[netip.AddrPort]*endpointState{},
+			c: &Conn{
+				noV4: atomic.Bool{},
+				noV6: atomic.Bool{},
+			},
+		}
+		endpoint.c.noV4.Store(test.noV4)
+		endpoint.c.noV6.Store(test.noV6)
+
+		for _, epd := range test.ep {
+			endpoint.endpointState[epd.addrPort] = &endpointState{}
+		}
+
+		udpAddr, _, shouldPing := endpoint.addrForSendLocked(testTime)
+		if !udpAddr.IsValid() {
+			t.Error("udpAddr returned is not valid")
+		}
+		if shouldPing != test.sendWGPing {
+			t.Errorf("addrForSendLocked did not indiciate correct ping state; got %v, want %v", shouldPing, test.sendWGPing)
+		}
+
+		for _, epd := range test.ep {
+			state, ok := endpoint.endpointState[epd.addrPort]
+			if !ok {
+				t.Errorf("addr does not exist in endpoint state map")
+			}
+
+			latency, ok := state.latencyLocked()
+			if ok {
+				t.Errorf("latency was set for %v: %v", epd.addrPort, latency)
+			}
+			state.recentPongs = append(state.recentPongs, pongReply{
+				latency: epd.latency,
+			})
+			state.recentPong = 0
+		}
+
+		udpAddr, _, shouldPing = endpoint.addrForSendLocked(testTime.Add(2 * time.Minute))
+		if udpAddr != test.want {
+			t.Errorf("udpAddr returned is not expected: got %v, want %v", udpAddr, test.want)
+		}
+		if shouldPing {
+			t.Error("addrForSendLocked should not indicate ping is required")
+		}
+		if endpoint.bestAddr.AddrPort != test.want {
+			t.Errorf("bestAddr.AddrPort is not as expected: got %v, want %v", endpoint.bestAddr.AddrPort, test.want)
 		}
 	}
 }

@@ -63,41 +63,47 @@ func (src *Node) Clone() *Node {
 		*dst.Online = *src.Online
 	}
 	dst.Capabilities = append(src.Capabilities[:0:0], src.Capabilities...)
+	if dst.SelfNodeV4MasqAddrForThisPeer != nil {
+		dst.SelfNodeV4MasqAddrForThisPeer = new(netip.Addr)
+		*dst.SelfNodeV4MasqAddrForThisPeer = *src.SelfNodeV4MasqAddrForThisPeer
+	}
 	return dst
 }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _NodeCloneNeedsRegeneration = Node(struct {
-	ID                      NodeID
-	StableID                StableNodeID
-	Name                    string
-	User                    UserID
-	Sharer                  UserID
-	Key                     key.NodePublic
-	KeyExpiry               time.Time
-	KeySignature            tkatype.MarshaledSignature
-	Machine                 key.MachinePublic
-	DiscoKey                key.DiscoPublic
-	Addresses               []netip.Prefix
-	AllowedIPs              []netip.Prefix
-	Endpoints               []string
-	DERP                    string
-	Hostinfo                HostinfoView
-	Created                 time.Time
-	Cap                     CapabilityVersion
-	Tags                    []string
-	PrimaryRoutes           []netip.Prefix
-	LastSeen                *time.Time
-	Online                  *bool
-	KeepAlive               bool
-	MachineAuthorized       bool
-	Capabilities            []string
-	UnsignedPeerAPIOnly     bool
-	ComputedName            string
-	computedHostIfDifferent string
-	ComputedNameWithHost    string
-	DataPlaneAuditLogID     string
-	Expired                 bool
+	ID                            NodeID
+	StableID                      StableNodeID
+	Name                          string
+	User                          UserID
+	Sharer                        UserID
+	Key                           key.NodePublic
+	KeyExpiry                     time.Time
+	KeySignature                  tkatype.MarshaledSignature
+	Machine                       key.MachinePublic
+	DiscoKey                      key.DiscoPublic
+	Addresses                     []netip.Prefix
+	AllowedIPs                    []netip.Prefix
+	Endpoints                     []string
+	DERP                          string
+	Hostinfo                      HostinfoView
+	Created                       time.Time
+	Cap                           CapabilityVersion
+	Tags                          []string
+	PrimaryRoutes                 []netip.Prefix
+	LastSeen                      *time.Time
+	Online                        *bool
+	KeepAlive                     bool
+	MachineAuthorized             bool
+	Capabilities                  []string
+	UnsignedPeerAPIOnly           bool
+	ComputedName                  string
+	computedHostIfDifferent       string
+	ComputedNameWithHost          string
+	DataPlaneAuditLogID           string
+	Expired                       bool
+	SelfNodeV4MasqAddrForThisPeer *netip.Addr
+	IsWireGuardOnly               bool
 }{})
 
 // Clone makes a deep copy of Hostinfo.
@@ -347,6 +353,7 @@ var _DERPNodeCloneNeedsRegeneration = DERPNode(struct {
 	DERPPort         int
 	InsecureForTests bool
 	STUNTestIP       string
+	CanPort80        bool
 }{})
 
 // Clone makes a deep copy of SSHRule.
@@ -371,10 +378,7 @@ func (src *SSHRule) Clone() *SSHRule {
 			dst.SSHUsers[k] = v
 		}
 	}
-	if dst.Action != nil {
-		dst.Action = new(SSHAction)
-		*dst.Action = *src.Action
-	}
+	dst.Action = src.Action.Clone()
 	return dst
 }
 
@@ -384,6 +388,35 @@ var _SSHRuleCloneNeedsRegeneration = SSHRule(struct {
 	Principals  []*SSHPrincipal
 	SSHUsers    map[string]string
 	Action      *SSHAction
+}{})
+
+// Clone makes a deep copy of SSHAction.
+// The result aliases no memory with the original.
+func (src *SSHAction) Clone() *SSHAction {
+	if src == nil {
+		return nil
+	}
+	dst := new(SSHAction)
+	*dst = *src
+	dst.Recorders = append(src.Recorders[:0:0], src.Recorders...)
+	if dst.OnRecordingFailure != nil {
+		dst.OnRecordingFailure = new(SSHRecorderFailureAction)
+		*dst.OnRecordingFailure = *src.OnRecordingFailure
+	}
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _SSHActionCloneNeedsRegeneration = SSHAction(struct {
+	Message                  string
+	Reject                   bool
+	Accept                   bool
+	SessionDuration          time.Duration
+	AllowAgentForwarding     bool
+	HoldAndDelegate          string
+	AllowLocalPortForwarding bool
+	Recorders                []netip.AddrPort
+	OnRecordingFailure       *SSHRecorderFailureAction
 }{})
 
 // Clone makes a deep copy of SSHPrincipal.
@@ -426,7 +459,7 @@ var _ControlDialPlanCloneNeedsRegeneration = ControlDialPlan(struct {
 
 // Clone duplicates src into dst and reports whether it succeeded.
 // To succeed, <src, dst> must be of types <*T, *T> or <*T, **T>,
-// where T is one of User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHPrincipal,ControlDialPlan.
+// where T is one of User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan.
 func Clone(dst, src any) bool {
 	switch src := src.(type) {
 	case *User:
@@ -525,6 +558,15 @@ func Clone(dst, src any) bool {
 			*dst = *src.Clone()
 			return true
 		case **SSHRule:
+			*dst = src.Clone()
+			return true
+		}
+	case *SSHAction:
+		switch dst := dst.(type) {
+		case *SSHAction:
+			*dst = *src.Clone()
+			return true
+		case **SSHAction:
 			*dst = src.Clone()
 			return true
 		}

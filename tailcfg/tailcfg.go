@@ -3,7 +3,7 @@
 
 package tailcfg
 
-//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHPrincipal,ControlDialPlan --clonefunc
+//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan --clonefunc
 
 import (
 	"bytes"
@@ -94,7 +94,12 @@ type CapabilityVersion int
 //   - 55: 2023-01-23: start of c2n GET+POST /update handler
 //   - 56: 2023-01-24: Client understands CapabilityDebugTSDNSResolution
 //   - 57: 2023-01-25: Client understands CapabilityBindToInterfaceByRoute
-const CurrentCapabilityVersion CapabilityVersion = 57
+//   - 58: 2023-03-10: Client retries lite map updates before restarting map poll.
+//   - 59: 2023-03-16: Client understands Peers[].SelfNodeV4MasqAddrForThisPeer
+//   - 60: 2023-04-06: Client understands IsWireGuardOnly
+//   - 61: 2023-04-18: Client understand SSHAction.SSHRecorderFailureAction
+//   - 62: 2023-05-05: Client can notify control over noise for SSHEventNotificationRequest recording failure events
+const CurrentCapabilityVersion CapabilityVersion = 62
 
 type StableID string
 
@@ -182,7 +187,12 @@ func (emptyStructJSONSlice) UnmarshalJSON([]byte) error { return nil }
 type Node struct {
 	ID       NodeID
 	StableID StableNodeID
-	Name     string // DNS
+
+	// Name is the FQDN of the node.
+	// It is also the MagicDNS name for the node.
+	// It has a trailing dot.
+	// e.g. "host.tail-scale.ts.net."
+	Name string
 
 	// User is the user who created the node. If ACL tags are in
 	// use for the node then it doesn't reflect the ACL identity
@@ -267,6 +277,27 @@ type Node struct {
 	// the client, this is calculated client-side based on a timestamp sent
 	// from control, to avoid clock skew issues.
 	Expired bool `json:",omitempty"`
+
+	// SelfNodeV4MasqAddrForThisPeer is the IPv4 that this peer knows the current node as.
+	// It may be empty if the peer knows the current node by its native
+	// IPv4 address.
+	// This field is only populated in a MapResponse for peers and not
+	// for the current node.
+	//
+	// If set, it should be used to masquerade traffic originating from the
+	// current node to this peer. The masquerade address is only relevant
+	// for this peer and not for other peers.
+	//
+	// This only applies to traffic originating from the current node to the
+	// peer or any of its subnets. Traffic originating from subnet routes will
+	// not be masqueraded (e.g. in case of --snat-subnet-routes).
+	SelfNodeV4MasqAddrForThisPeer *netip.Addr `json:",omitempty"`
+
+	// IsWireGuardOnly indicates that this is a non-Tailscale WireGuard peer, it
+	// is not expected to speak Disco or DERP, and it must have Endpoints in
+	// order to be reachable. TODO(#7826): 2023-04-06: only the first parseable
+	// Endpoint is used, see #7826 for updates.
+	IsWireGuardOnly bool `json:",omitempty"`
 }
 
 // DisplayName returns the user-facing name for a node which should
@@ -311,6 +342,11 @@ func (n *Node) DisplayNames(forOwner bool) (name, hostIfDifferent string) {
 		return n.ComputedName, n.computedHostIfDifferent
 	}
 	return n.ComputedName, ""
+}
+
+// IsTagged reports whether the node has any tags.
+func (n *Node) IsTagged() bool {
+	return len(n.Tags) > 0
 }
 
 // InitDisplayNames computes and populates n's display name
@@ -1058,6 +1094,11 @@ type PortRange struct {
 	Last  uint16
 }
 
+// Contains reports whether port is in pr.
+func (pr PortRange) Contains(port uint16) bool {
+	return port >= pr.First && port <= pr.Last
+}
+
 var PortRangeAny = PortRange{0, 65535}
 
 // NetPortRange represents a range of ports that's allowed for one or more IPs.
@@ -1666,7 +1707,7 @@ func (n *Node) Equal(n2 *Node) bool {
 		bytes.Equal(n.KeySignature, n2.KeySignature) &&
 		n.Machine == n2.Machine &&
 		n.DiscoKey == n2.DiscoKey &&
-		eqBoolPtr(n.Online, n2.Online) &&
+		eqPtr(n.Online, n2.Online) &&
 		eqCIDRs(n.Addresses, n2.Addresses) &&
 		eqCIDRs(n.AllowedIPs, n2.AllowedIPs) &&
 		eqCIDRs(n.PrimaryRoutes, n2.PrimaryRoutes) &&
@@ -1682,10 +1723,12 @@ func (n *Node) Equal(n2 *Node) bool {
 		n.computedHostIfDifferent == n2.computedHostIfDifferent &&
 		n.ComputedNameWithHost == n2.ComputedNameWithHost &&
 		eqStrings(n.Tags, n2.Tags) &&
-		n.Expired == n2.Expired
+		n.Expired == n2.Expired &&
+		eqPtr(n.SelfNodeV4MasqAddrForThisPeer, n2.SelfNodeV4MasqAddrForThisPeer) &&
+		n.IsWireGuardOnly == n2.IsWireGuardOnly
 }
 
-func eqBoolPtr(a, b *bool) bool {
+func eqPtr[T comparable](a, b *T) bool {
 	if a == b { // covers nil
 		return true
 	}
@@ -1693,7 +1736,6 @@ func eqBoolPtr(a, b *bool) bool {
 		return false
 	}
 	return *a == *b
-
 }
 
 func eqStrings(a, b []string) bool {
@@ -1806,7 +1848,8 @@ const (
 
 	// Funnel warning capabilities used for reporting errors to the user.
 
-	// CapabilityWarnFunnelNoInvite indicates an invite has not been accepted for the Funnel alpha.
+	// CapabilityWarnFunnelNoInvite indicates whether Funnel is enabled for the tailnet.
+	// NOTE: In transition from Alpha to Beta, this capability is being reused as the enablement.
 	CapabilityWarnFunnelNoInvite = "https://tailscale.com/cap/warn-funnel-no-invite"
 
 	// CapabilityWarnFunnelNoHTTPS indicates HTTPS has not been enabled for the tailnet.
@@ -1818,6 +1861,12 @@ const (
 	// resolution for Tailscale-controlled domains (the control server, log
 	// server, DERP servers, etc.)
 	CapabilityDebugTSDNSResolution = "https://tailscale.com/cap/debug-ts-dns-resolution"
+
+	// CapabilityFunnelPorts specifies the ports that the Funnel is available on.
+	// The ports are specified as a comma-separated list of port numbers or port
+	// ranges (e.g. "80,443,8080-8090") in the ports query parameter.
+	// e.g. https://tailscale.com/cap/funnel-ports?ports=80,443,8080-8090
+	CapabilityFunnelPorts = "https://tailscale.com/cap/funnel-ports"
 )
 
 const (
@@ -1999,9 +2048,94 @@ type SSHAction struct {
 	// to use local port forwarding if requested.
 	AllowLocalPortForwarding bool `json:"allowLocalPortForwarding,omitempty"`
 
-	// SessionHaulTargetNode, if non-empty, is the Stable ID of a peer to
-	// stream this SSH session's logs to.
-	SessionHaulTargetNode StableNodeID `json:"sessionHaulTargetNode,omitempty"`
+	// Recorders defines the destinations of the SSH session recorders.
+	// The recording will be uploaded to http://addr:port/record.
+	Recorders []netip.AddrPort `json:"recorders,omitempty"`
+
+	// OnRecorderFailure is the action to take if recording fails.
+	// If nil, the default action is to fail open.
+	OnRecordingFailure *SSHRecorderFailureAction `json:"onRecordingFailure,omitempty"`
+}
+
+// SSHRecorderFailureAction is the action to take if recording fails.
+type SSHRecorderFailureAction struct {
+	// RejectSessionWithMessage, if not empty, specifies that the session should
+	// be rejected if the recording fails to start.
+	// The message will be shown to the user before the session is rejected.
+	RejectSessionWithMessage string `json:",omitempty"`
+
+	// TerminateSessionWithMessage, if not empty, specifies that the session
+	// should be terminated if the recording fails after it has started. The
+	// message will be shown to the user before the session is terminated.
+	TerminateSessionWithMessage string `json:",omitempty"`
+
+	// NotifyURL, if non-empty, specifies a HTTP POST URL to notify when the
+	// recording fails. The payload is the JSON encoded
+	// SSHRecordingFailureNotifyRequest struct. The host field in the URL is
+	// ignored, and it will be sent to control over the Noise transport.
+	NotifyURL string `json:",omitempty"`
+}
+
+// SSHEventNotifyRequest is the JSON payload sent to the NotifyURL
+// for an SSH event.
+type SSHEventNotifyRequest struct {
+	// EventType is the type of notify request being sent.
+	EventType SSHEventType
+
+	// ConnectionID uniquely identifies a connection made to the SSH server.
+	// It may be shared across multiple sessions over the same connection in
+	// case a single connection creates multiple sessions.
+	ConnectionID string
+
+	// CapVersion is the client's current CapabilityVersion.
+	CapVersion CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
+
+	// SrcNode is the ID of the node that initiated the SSH session.
+	SrcNode NodeID
+
+	// SSHUser is the user that was presented to the SSH server.
+	SSHUser string
+
+	// LocalUser is the user that was resolved from the SSHUser for the local machine.
+	LocalUser string
+
+	// RecordingAttempts is the list of recorders that were attempted, in order.
+	RecordingAttempts []*SSHRecordingAttempt
+}
+
+// SSHEventType defines the event type linked to a SSH action or state.
+type SSHEventType int
+
+const (
+	UnspecifiedSSHEventType SSHEventType = 0
+	// SSHSessionRecordingRejected is the event that
+	// defines when a SSH session cannot be started
+	// because no recorder is available for session
+	// recording, and the SSHRecorderFailureAction
+	// RejectSessionWithMessage is not empty.
+	SSHSessionRecordingRejected SSHEventType = 1
+	// SSHSessionRecordingTerminated is the event that
+	// defines when session recording has failed
+	// during the session and the SSHRecorderFailureAction
+	// TerminateSessionWithMessage is not empty.
+	SSHSessionRecordingTerminated SSHEventType = 2
+	// SSHSessionRecordingFailed is the event that
+	// defines when session recording is unavailable and
+	// the SSHRecorderFailureAction RejectSessionWithMessage
+	// or TerminateSessionWithMessage is empty.
+	SSHSessionRecordingFailed SSHEventType = 3
+)
+
+// SSHRecordingAttempt is a single attempt to start a recording.
+type SSHRecordingAttempt struct {
+	// Recorder is the address of the recorder that was attempted.
+	Recorder netip.AddrPort
+
+	// FailureMessage is the error message of the failed attempt.
+	FailureMessage string
 }
 
 // OverTLSPublicKeyResponse is the JSON response to /key?v=<n>

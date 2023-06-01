@@ -31,6 +31,7 @@ import (
 	"tailscale.com/derp"
 	"tailscale.com/envknob"
 	"tailscale.com/net/dnscache"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tlsdial"
@@ -55,6 +56,7 @@ type Client struct {
 
 	privateKey key.NodePrivate
 	logf       logger.Logf
+	netMon     *netmon.Monitor // optional; nil means interfaces will be looked up on-demand
 	dialer     func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Either url or getRegion is non-nil:
@@ -82,13 +84,19 @@ type Client struct {
 	pingOut      map[derp.PingMessage]chan<- bool // chan to send to on pong
 }
 
+func (c *Client) String() string {
+	return fmt.Sprintf("<derphttp_client.Client %s url=%s>", c.serverPubKey.ShortString(), c.url)
+}
+
 // NewRegionClient returns a new DERP-over-HTTP client. It connects lazily.
 // To trigger a connection, use Connect.
-func NewRegionClient(privateKey key.NodePrivate, logf logger.Logf, getRegion func() *tailcfg.DERPRegion) *Client {
+// The netMon parameter is optional; if non-nil it's used to do faster interface lookups.
+func NewRegionClient(privateKey key.NodePrivate, logf logger.Logf, netMon *netmon.Monitor, getRegion func() *tailcfg.DERPRegion) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
 		privateKey: privateKey,
 		logf:       logf,
+		netMon:     netMon,
 		getRegion:  getRegion,
 		ctx:        ctx,
 		cancelCtx:  cancel,
@@ -170,6 +178,10 @@ func urlPort(u *url.URL) string {
 	return ""
 }
 
+// debugDERPUseHTTP tells clients to connect to DERP via HTTP on port
+// 3340 instead of HTTPS on 443.
+var debugUseDERPHTTP = envknob.RegisterBool("TS_DEBUG_USE_DERP_HTTP")
+
 func (c *Client) targetString(reg *tailcfg.DERPRegion) string {
 	if c.url != nil {
 		return c.url.String()
@@ -181,6 +193,10 @@ func (c *Client) useHTTPS() bool {
 	if c.url != nil && c.url.Scheme == "http" {
 		return false
 	}
+	if debugUseDERPHTTP() {
+		return false
+	}
+
 	return true
 }
 
@@ -196,7 +212,11 @@ func (c *Client) urlString(node *tailcfg.DERPNode) string {
 	if c.url != nil {
 		return c.url.String()
 	}
-	return fmt.Sprintf("https://%s/derp", node.HostName)
+	proto := "https"
+	if debugUseDERPHTTP() {
+		proto = "http"
+	}
+	return fmt.Sprintf("%s://%s/derp", proto, node.HostName)
 }
 
 // AddressFamilySelector decides whether IPv6 is preferred for
@@ -321,7 +341,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		}
 		c.serverPubKey = derpClient.ServerPublicKey()
 		c.client = derpClient
-		c.netConn = tcpConn
+		c.netConn = conn
 		c.connGen++
 		return c.client, c.connGen, nil
 	case c.url != nil:
@@ -476,7 +496,7 @@ func (c *Client) dialURL(ctx context.Context) (net.Conn, error) {
 		return c.dialer(ctx, "tcp", net.JoinHostPort(host, urlPort(c.url)))
 	}
 	hostOrIP := host
-	dialer := netns.NewDialer(c.logf)
+	dialer := netns.NewDialer(c.logf, c.netMon)
 
 	if c.DNSCache != nil {
 		ip, _, _, err := c.DNSCache.LookupIP(ctx, host)
@@ -571,7 +591,7 @@ func (c *Client) DialRegionTLS(ctx context.Context, reg *tailcfg.DERPRegion) (tl
 }
 
 func (c *Client) dialContext(ctx context.Context, proto, addr string) (net.Conn, error) {
-	return netns.NewDialer(c.logf).DialContext(ctx, proto, addr)
+	return netns.NewDialer(c.logf, c.netMon).DialContext(ctx, proto, addr)
 }
 
 // shouldDialProto reports whether an explicitly provided IPv4 or IPv6
@@ -616,7 +636,7 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 	ctx, cancel := context.WithTimeout(ctx, dialNodeTimeout)
 	defer cancel()
 
-	ctx = sockstats.WithSockStats(ctx, "derphttp.Client")
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDERPHTTPClient, c.logf)
 
 	nwait := 0
 	startDial := func(dstPrimary, proto string) {

@@ -102,12 +102,21 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 		cgo = nativeGOOS == "darwin"
 		tags = append(tags, "omitidna", "omitpemdecrypt")
 		if env.IsSet("XCODE_VERSION_ACTUAL") {
+			// If we're building via Xcode, we must be making the extension
+			// version (as opposed to tailscaled on Mac).
+			tags = append(tags, "ts_macext")
+
 			var xcodeFlags []string
 			// Minimum OS version being targeted, results in
-			// e.g. -mmacosx-version-min=11.3
-			minOSKey := env.Get("DEPLOYMENT_TARGET_CLANG_FLAG_NAME", "")
-			minOSVal := env.Get(env.Get("DEPLOYMENT_TARGET_CLANG_ENV_NAME", ""), "")
-			xcodeFlags = append(xcodeFlags, fmt.Sprintf("-%s=%s", minOSKey, minOSVal))
+			// e.g. -mmacosx-version-min=11.3, -miphoneos-version-min=15.0
+			switch {
+			case env.IsSet("IPHONEOS_DEPLOYMENT_TARGET"):
+				xcodeFlags = append(xcodeFlags, "-miphoneos-version-min="+env.Get("IPHONEOS_DEPLOYMENT_TARGET", ""))
+			case env.IsSet("MACOSX_DEPLOYMENT_TARGET"):
+				xcodeFlags = append(xcodeFlags, "-mmacosx-version-min="+env.Get("MACOSX_DEPLOYMENT_TARGET", ""))
+			default:
+				return nil, nil, fmt.Errorf("invoked by Xcode but couldn't figure out deployment target. Did Xcode change its envvars again?")
+			}
 
 			// Target-specific SDK directory. Must be passed as two
 			// words ("-isysroot PATH", not "-isysroot=PATH").
@@ -144,7 +153,9 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 
 	env.Set("GOOS", targetOS)
 	env.Set("GOARCH", targetArch)
-	env.Set("GOARM", "5") // TODO: fix, see go/internal-bug/3092
+	if !env.IsSet("GOARM") {
+		env.Set("GOARM", "5") // TODO: fix, see go/internal-bug/3092
+	}
 	env.Set("GOMIPS", "softfloat")
 	env.Set("CGO_ENABLED", boolStr(cgo))
 	env.Set("CGO_CFLAGS", strings.Join(cgoCflags, " "))

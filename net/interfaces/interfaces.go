@@ -153,11 +153,9 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
 	if len(regular4) == 0 && len(regular6) == 0 {
 		// if we have no usable IP addresses then be willing to accept
 		// addresses we otherwise wouldn't, like:
-		//   + 169.254.x.x (AWS Lambda uses NAT with these)
+		//   + 169.254.x.x (AWS Lambda and Azure App Services use NAT with these)
 		//   + IPv6 ULA (Google Cloud Run uses these with address translation)
-		if hostinfo.GetEnvType() == hostinfo.AWSLambda {
-			regular4 = linklocal4
-		}
+		regular4 = linklocal4
 		regular6 = ula6
 	}
 	regular = append(regular4, regular6...)
@@ -352,12 +350,6 @@ func (s *State) String() string {
 	fmt.Fprintf(&sb, " v4=%v v6=%v}", s.HaveV4, s.HaveV6)
 	return sb.String()
 }
-
-// ChangeFunc is a callback function (usually registered with
-// wgengine/monitor's Mon) that's called when the network
-// changed. The changed parameter is whether the network changed
-// enough for State to have changed since the last callback.
-type ChangeFunc func(changed bool, state *State)
 
 // An InterfaceFilter indicates whether EqualFiltered should use i when deciding whether two States are equal.
 // ips are all the IPPrefixes associated with i.
@@ -645,7 +637,14 @@ func isUsableV4(ip netip.Addr) bool {
 		return false
 	}
 	if ip.IsLinkLocalUnicast() {
-		return hostinfo.GetEnvType() == hostinfo.AWSLambda
+		switch hostinfo.GetEnvType() {
+		case hostinfo.AWSLambda:
+			return true
+		case hostinfo.AzureAppService:
+			return true
+		default:
+			return false
+		}
 	}
 	return true
 }

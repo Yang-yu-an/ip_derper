@@ -5,6 +5,7 @@ package syncs
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -64,7 +65,13 @@ func TestWatchMultipleValues(t *testing.T) {
 			cancel()
 		}
 	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+	// See https://github.com/golang/go/issues/44343 - on Windows the Go runtime timer resolution is currently too coarse. Allow longer in that case.
+	want := 100 * time.Millisecond
+	if runtime.GOOS == "windows" {
+		want = 500 * time.Millisecond
+	}
+
+	if elapsed := time.Since(start); elapsed > want {
 		t.Errorf("expected 1 event per millisecond, got only %v events in %v", n, elapsed)
 	}
 }

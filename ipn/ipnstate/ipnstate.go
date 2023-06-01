@@ -88,6 +88,7 @@ type TKAFilteredPeer struct {
 	ID           tailcfg.NodeID
 	StableID     tailcfg.StableNodeID
 	TailscaleIPs []netip.Addr // Tailscale IP(s) assigned to this node
+	NodeKey      key.NodePublic
 }
 
 // NetworkLockStatus represents whether network-lock is enabled,
@@ -120,6 +121,11 @@ type NetworkLockStatus struct {
 	// (i.e. no connectivity) because they failed tailnet lock
 	// checks.
 	FilteredPeers []*TKAFilteredPeer
+
+	// StateID is a nonce associated with the network lock authority,
+	// generated upon enablement. This field is not populated if the
+	// network lock is disabled.
+	StateID uint64
 }
 
 // NetworkLockUpdate describes a change to network-lock state.

@@ -379,7 +379,6 @@ cusimanse
 polecat
 degu
 coatimundi
-stringray
 diplodocus
 stegosaurus
 zuul
@@ -540,3 +539,8 @@ tailor
 uaru
 vimba
 wahoo
+coelacanth
+llama
+shrimp
+prawn
+lobster

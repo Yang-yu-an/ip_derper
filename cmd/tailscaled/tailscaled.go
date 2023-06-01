@@ -39,25 +39,28 @@ import (
 	"tailscale.com/logtail"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/dnsfallback"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/net/tstun"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/smallzstd"
 	"tailscale.com/syncs"
-	"tailscale.com/tsweb"
+	"tailscale.com/tsd"
+	"tailscale.com/tsweb/varz"
 	"tailscale.com/types/flagtype"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
-	"tailscale.com/wgengine/monitor"
 	"tailscale.com/wgengine/netstack"
 	"tailscale.com/wgengine/router"
 )
@@ -327,7 +330,19 @@ var logPol *logpolicy.Policy
 var debugMux *http.ServeMux
 
 func run() error {
-	pol := logpolicy.New(logtail.CollectionNode)
+	var logf logger.Logf = log.Printf
+
+	sys := new(tsd.System)
+
+	netMon, err := netmon.New(func(format string, args ...any) {
+		logf(format, args...)
+	})
+	if err != nil {
+		return fmt.Errorf("netmon.New: %w", err)
+	}
+	sys.Set(netMon)
+
+	pol := logpolicy.New(logtail.CollectionNode, netMon)
 	pol.SetVerbosityLevel(args.verbose)
 	logPol = pol
 	defer func() {
@@ -351,7 +366,6 @@ func run() error {
 		return nil
 	}
 
-	var logf logger.Logf = log.Printf
 	if envknob.Bool("TS_DEBUG_MEMORY") {
 		logf = logger.RusagePrefixLog(logf)
 	}
@@ -377,11 +391,10 @@ func run() error {
 		debugMux = newDebugMux()
 	}
 
-	logid := pol.PublicID.String()
-	return startIPNServer(context.Background(), logf, logid)
+	return startIPNServer(context.Background(), logf, pol.PublicID, sys)
 }
 
-func startIPNServer(ctx context.Context, logf logger.Logf, logid string) error {
+func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID, sys *tsd.System) error {
 	ln, err := safesocket.Listen(args.socketpath)
 	if err != nil {
 		return fmt.Errorf("safesocket.Listen: %v", err)
@@ -407,7 +420,7 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logid string) error {
 		}
 	}()
 
-	srv := ipnserver.New(logf, logid)
+	srv := ipnserver.New(logf, logID, sys.NetMon.Get())
 	if debugMux != nil {
 		debugMux.HandleFunc("/debug/ipn", srv.ServeHTMLStatus)
 	}
@@ -425,7 +438,7 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logid string) error {
 				return
 			}
 		}
-		lb, err := getLocalBackend(ctx, logf, logid)
+		lb, err := getLocalBackend(ctx, logf, logID, sys)
 		if err == nil {
 			logf("got LocalBackend in %v", time.Since(t0).Round(time.Millisecond))
 			srv.SetLocalBackend(lb)
@@ -449,35 +462,28 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logid string) error {
 	return nil
 }
 
-func getLocalBackend(ctx context.Context, logf logger.Logf, logid string) (_ *ipnlocal.LocalBackend, retErr error) {
-	linkMon, err := monitor.New(logf)
-	if err != nil {
-		return nil, fmt.Errorf("monitor.New: %w", err)
-	}
+func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID, sys *tsd.System) (_ *ipnlocal.LocalBackend, retErr error) {
 	if logPol != nil {
-		logPol.Logtail.SetLinkMonitor(linkMon)
+		logPol.Logtail.SetNetMon(sys.NetMon.Get())
 	}
 
 	socksListener, httpProxyListener := mustStartProxyListeners(args.socksAddr, args.httpProxyAddr)
 
 	dialer := &tsdial.Dialer{Logf: logf} // mutated below (before used)
-	e, onlyNetstack, err := createEngine(logf, linkMon, dialer)
+	sys.Set(dialer)
+
+	onlyNetstack, err := createEngine(logf, sys)
 	if err != nil {
 		return nil, fmt.Errorf("createEngine: %w", err)
 	}
-	if _, ok := e.(wgengine.ResolvingEngine).GetResolver(); !ok {
-		panic("internal error: exit node resolver not wired up")
-	}
 	if debugMux != nil {
-		if ig, ok := e.(wgengine.InternalsGetter); ok {
-			if _, mc, _, ok := ig.GetInternals(); ok {
-				debugMux.HandleFunc("/debug/magicsock", mc.ServeHTTPDebug)
-			}
+		if ms, ok := sys.MagicSock.GetOK(); ok {
+			debugMux.HandleFunc("/debug/magicsock", ms.ServeHTTPDebug)
 		}
 		go runDebugServer(debugMux, args.debug)
 	}
 
-	ns, err := newNetstack(logf, dialer, e)
+	ns, err := newNetstack(logf, sys)
 	if err != nil {
 		return nil, fmt.Errorf("newNetstack: %w", err)
 	}
@@ -485,6 +491,7 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logid string) (_ *ip
 	ns.ProcessSubnets = onlyNetstack || handleSubnetsInNetstack()
 
 	if onlyNetstack {
+		e := sys.Engine.Get()
 		dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 			_, ok := e.PeerForIP(ip)
 			return ok
@@ -494,11 +501,13 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logid string) (_ *ip
 		}
 	}
 	if socksListener != nil || httpProxyListener != nil {
+		var addrs []string
 		if httpProxyListener != nil {
 			hs := &http.Server{Handler: httpProxyHandler(dialer.UserDial)}
 			go func() {
 				log.Fatalf("HTTP proxy exited: %v", hs.Serve(httpProxyListener))
 			}()
+			addrs = append(addrs, httpProxyListener.Addr().String())
 		}
 		if socksListener != nil {
 			ss := &socks5.Server{
@@ -508,10 +517,10 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logid string) (_ *ip
 			go func() {
 				log.Fatalf("SOCKS5 server exited: %v", ss.Serve(socksListener))
 			}()
+			addrs = append(addrs, socksListener.Addr().String())
 		}
+		tshttpproxy.SetSelfProxy(addrs...)
 	}
-
-	e = wgengine.NewWatchdog(e)
 
 	opts := ipnServerOpts()
 
@@ -519,8 +528,9 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logid string) (_ *ip
 	if err != nil {
 		return nil, fmt.Errorf("store.New: %w", err)
 	}
+	sys.Set(store)
 
-	lb, err := ipnlocal.NewLocalBackend(logf, logid, store, dialer, e, opts.LoginFlags)
+	lb, err := ipnlocal.NewLocalBackend(logf, logID, sys, opts.LoginFlags)
 	if err != nil {
 		return nil, fmt.Errorf("ipnlocal.NewLocalBackend: %w", err)
 	}
@@ -529,7 +539,7 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logid string) (_ *ip
 		lb.SetLogFlusher(logPol.Logtail.StartFlush)
 	}
 	if root := lb.TailscaleVarRoot(); root != "" {
-		dnsfallback.SetCachePath(filepath.Join(root, "derpmap.cached.json"))
+		dnsfallback.SetCachePath(filepath.Join(root, "derpmap.cached.json"), logf)
 	}
 	lb.SetDecompressor(func() (controlclient.Decompressor, error) {
 		return smallzstd.NewDecoder(nil)
@@ -546,21 +556,21 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logid string) (_ *ip
 //
 // onlyNetstack is true if the user has explicitly requested that we use netstack
 // for all networking.
-func createEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer) (e wgengine.Engine, onlyNetstack bool, err error) {
+func createEngine(logf logger.Logf, sys *tsd.System) (onlyNetstack bool, err error) {
 	if args.tunname == "" {
-		return nil, false, errors.New("no --tun value specified")
+		return false, errors.New("no --tun value specified")
 	}
 	var errs []error
 	for _, name := range strings.Split(args.tunname, ",") {
 		logf("wgengine.NewUserspaceEngine(tun %q) ...", name)
-		e, onlyNetstack, err = tryEngine(logf, linkMon, dialer, name)
+		onlyNetstack, err = tryEngine(logf, sys, name)
 		if err == nil {
-			return e, onlyNetstack, nil
+			return onlyNetstack, nil
 		}
 		logf("wgengine.NewUserspaceEngine(tun %q) error: %v", name, err)
 		errs = append(errs, err)
 	}
-	return nil, false, multierr.New(errs...)
+	return false, multierr.New(errs...)
 }
 
 // handleSubnetsInNetstack reports whether netstack should handle subnet routers
@@ -585,21 +595,23 @@ func handleSubnetsInNetstack() bool {
 
 var tstunNew = tstun.New
 
-func tryEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer, name string) (e wgengine.Engine, onlyNetstack bool, err error) {
+func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack bool, err error) {
 	conf := wgengine.Config{
-		ListenPort:  args.port,
-		LinkMonitor: linkMon,
-		Dialer:      dialer,
+		ListenPort:   args.port,
+		NetMon:       sys.NetMon.Get(),
+		Dialer:       sys.Dialer.Get(),
+		SetSubsystem: sys.Set,
 	}
 
 	onlyNetstack = name == "userspace-networking"
+	netstackSubnetRouter := onlyNetstack // but mutated later on some platforms
 	netns.SetEnabled(!onlyNetstack)
 
 	if args.birdSocketPath != "" && createBIRDClient != nil {
 		log.Printf("Connecting to BIRD at %s ...", args.birdSocketPath)
 		conf.BIRDClient, err = createBIRDClient(args.birdSocketPath)
 		if err != nil {
-			return nil, false, fmt.Errorf("createBIRDClient: %w", err)
+			return false, fmt.Errorf("createBIRDClient: %w", err)
 		}
 	}
 	if onlyNetstack {
@@ -612,44 +624,55 @@ func tryEngine(logf logger.Logf, linkMon *monitor.Mon, dialer *tsdial.Dialer, na
 			// TODO(bradfitz): add a Synology-specific DNS manager.
 			conf.DNS, err = dns.NewOSConfigurator(logf, "") // empty interface name
 			if err != nil {
-				return nil, false, fmt.Errorf("dns.NewOSConfigurator: %w", err)
+				return false, fmt.Errorf("dns.NewOSConfigurator: %w", err)
 			}
 		}
 	} else {
 		dev, devName, err := tstunNew(logf, name)
 		if err != nil {
 			tstun.Diagnose(logf, name, err)
-			return nil, false, fmt.Errorf("tstun.New(%q): %w", name, err)
+			return false, fmt.Errorf("tstun.New(%q): %w", name, err)
 		}
 		conf.Tun = dev
 		if strings.HasPrefix(name, "tap:") {
 			conf.IsTAP = true
 			e, err := wgengine.NewUserspaceEngine(logf, conf)
-			return e, false, err
+			if err != nil {
+				return false, err
+			}
+			sys.Set(e)
+			return false, err
 		}
 
-		r, err := router.New(logf, dev, linkMon)
+		r, err := router.New(logf, dev, sys.NetMon.Get())
 		if err != nil {
 			dev.Close()
-			return nil, false, fmt.Errorf("creating router: %w", err)
+			return false, fmt.Errorf("creating router: %w", err)
 		}
+
 		d, err := dns.NewOSConfigurator(logf, devName)
 		if err != nil {
 			dev.Close()
 			r.Close()
-			return nil, false, fmt.Errorf("dns.NewOSConfigurator: %w", err)
+			return false, fmt.Errorf("dns.NewOSConfigurator: %w", err)
 		}
 		conf.DNS = d
 		conf.Router = r
 		if handleSubnetsInNetstack() {
 			conf.Router = netstack.NewSubnetRouterWrapper(conf.Router)
+			netstackSubnetRouter = true
 		}
+		sys.Set(conf.Router)
 	}
-	e, err = wgengine.NewUserspaceEngine(logf, conf)
+	e, err := wgengine.NewUserspaceEngine(logf, conf)
 	if err != nil {
-		return nil, onlyNetstack, err
+		return onlyNetstack, err
 	}
-	return e, onlyNetstack, nil
+	e = wgengine.NewWatchdog(e)
+	sys.Set(e)
+	sys.NetstackRouter.Set(netstackSubnetRouter)
+
+	return onlyNetstack, nil
 }
 
 func newDebugMux() *http.ServeMux {
@@ -665,7 +688,7 @@ func newDebugMux() *http.ServeMux {
 
 func servePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
-	tsweb.VarzHandler(w, r)
+	varz.Handler(w, r)
 	clientmetric.WritePrometheusExpositionFormat(w)
 }
 
@@ -679,12 +702,8 @@ func runDebugServer(mux *http.ServeMux, addr string) {
 	}
 }
 
-func newNetstack(logf logger.Logf, dialer *tsdial.Dialer, e wgengine.Engine) (*netstack.Impl, error) {
-	tunDev, magicConn, dns, ok := e.(wgengine.InternalsGetter).GetInternals()
-	if !ok {
-		return nil, fmt.Errorf("%T is not a wgengine.InternalsGetter", e)
-	}
-	return netstack.Create(logf, tunDev, e, magicConn, dialer, dns)
+func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
+	return netstack.Create(logf, sys.Tun.Get(), sys.Engine.Get(), sys.MagicSock.Get(), sys.Dialer.Get(), sys.DNSManager.Get())
 }
 
 // mustStartProxyListeners creates listeners for local SOCKS and HTTP

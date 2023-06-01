@@ -7,8 +7,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -25,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/rest"
+	"k8s.io/client-go/transport"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,6 +48,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/version"
 )
 
 func main() {
@@ -62,6 +65,7 @@ func main() {
 		clientIDPath       = defaultEnv("CLIENT_ID_FILE", "")
 		clientSecretPath   = defaultEnv("CLIENT_SECRET_FILE", "")
 		image              = defaultEnv("PROXY_IMAGE", "tailscale/tailscale:latest")
+		priorityClassName  = defaultEnv("PROXY_PRIORITY_CLASS_NAME", "")
 		tags               = defaultEnv("PROXY_TAGS", "tag:k8s")
 		shouldRunAuthProxy = defaultBool("AUTH_PROXY", false)
 	)
@@ -198,12 +202,13 @@ waitOnline:
 	}
 
 	sr := &ServiceReconciler{
-		Client:            mgr.GetClient(),
-		tsClient:          tsClient,
-		defaultTags:       strings.Split(tags, ","),
-		operatorNamespace: tsNamespace,
-		proxyImage:        image,
-		logger:            zlog.Named("service-reconciler"),
+		Client:                 mgr.GetClient(),
+		tsClient:               tsClient,
+		defaultTags:            strings.Split(tags, ","),
+		operatorNamespace:      tsNamespace,
+		proxyImage:             image,
+		proxyPriorityClassName: priorityClassName,
+		logger:                 zlog.Named("service-reconciler"),
 	}
 
 	reconcileFilter := handler.EnqueueRequestsFromMapFunc(func(o client.Object) []reconcile.Request {
@@ -233,17 +238,27 @@ waitOnline:
 		startlog.Fatalf("could not create controller: %v", err)
 	}
 
-	startlog.Infof("Startup complete, operator running")
+	startlog.Infof("Startup complete, operator running, version: %s", version.Long())
 	if shouldRunAuthProxy {
-		rc, err := rest.TransportFor(restConfig)
+		cfg, err := restConfig.TransportConfig()
 		if err != nil {
-			startlog.Fatalf("could not get rest transport: %v", err)
+			startlog.Fatalf("could not get rest.TransportConfig(): %v", err)
 		}
-		authProxyListener, err := s.Listen("tcp", ":443")
+
+		// Kubernetes uses SPDY for exec and port-forward, however SPDY is
+		// incompatible with HTTP/2; so disable HTTP/2 in the proxy.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig, err = transport.TLSConfigFor(cfg)
 		if err != nil {
-			startlog.Fatalf("could not listen on :443: %v", err)
+			startlog.Fatalf("could not get transport.TLSConfigFor(): %v", err)
 		}
-		go runAuthProxy(lc, authProxyListener, rc, zlog.Named("auth-proxy").Infof)
+		tr.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+
+		rt, err := transport.HTTPWrappersForConfig(cfg, tr)
+		if err != nil {
+			startlog.Fatalf("could not get rest.TransportConfig(): %v", err)
+		}
+		go runAuthProxy(s, rt, zlog.Named("auth-proxy").Infof)
 	}
 	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
 		startlog.Fatalf("could not start manager: %v", err)
@@ -266,11 +281,12 @@ const (
 // ServiceReconciler is a simple ControllerManagedBy example implementation.
 type ServiceReconciler struct {
 	client.Client
-	tsClient          tsClient
-	defaultTags       []string
-	operatorNamespace string
-	proxyImage        string
-	logger            *zap.SugaredLogger
+	tsClient               tsClient
+	defaultTags            []string
+	operatorNamespace      string
+	proxyImage             string
+	proxyPriorityClassName string
+	logger                 *zap.SugaredLogger
 }
 
 type tsClient interface {
@@ -554,6 +570,9 @@ func (a *ServiceReconciler) getDeviceInfo(ctx context.Context, svc *corev1.Servi
 	if err != nil {
 		return "", "", err
 	}
+	if sec == nil {
+		return "", "", nil
+	}
 	id = string(sec.Data["device_id"])
 	if id == "" {
 		return "", "", nil
@@ -577,6 +596,7 @@ func (a *ServiceReconciler) newAuthKey(ctx context.Context, tags []string) (stri
 			},
 		},
 	}
+
 	key, _, err := a.tsClient.CreateKey(ctx, caps)
 	if err != nil {
 		return "", err
@@ -621,6 +641,7 @@ func (a *ServiceReconciler) reconcileSTS(ctx context.Context, logger *zap.Sugare
 	ss.Spec.Template.ObjectMeta.Labels = map[string]string{
 		"app": string(parentSvc.UID),
 	}
+	ss.Spec.Template.Spec.PriorityClassName = a.proxyPriorityClassName
 	logger.Debugf("reconciling statefulset %s/%s", ss.GetNamespace(), ss.GetName())
 	return createOrUpdate(ctx, a.Client, a.operatorNamespace, &ss, func(s *appsv1.StatefulSet) { s.Spec = ss.Spec })
 }

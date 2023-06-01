@@ -34,18 +34,19 @@ import (
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/logtail"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/portmapper"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
 	"tailscale.com/version"
-	"tailscale.com/wgengine/monitor"
 )
 
 type localAPIHandler func(*Handler, http.ResponseWriter, *http.Request)
@@ -71,7 +72,9 @@ var handler = map[string]localAPIHandler{
 	"debug-packet-filter-matches": (*Handler).serveDebugPacketFilterMatches,
 	"debug-packet-filter-rules":   (*Handler).serveDebugPacketFilterRules,
 	"debug-portmap":               (*Handler).serveDebugPortmap,
+	"debug-peer-endpoint-changes": (*Handler).serveDebugPeerEndpointChanges,
 	"debug-capture":               (*Handler).serveDebugCapture,
+	"debug-log":                   (*Handler).serveDebugLog,
 	"derpmap":                     (*Handler).serveDERPMap,
 	"dev-set-state-store":         (*Handler).serveDevSetStateStore,
 	"set-push-device-token":       (*Handler).serveSetPushDeviceToken,
@@ -100,6 +103,7 @@ var handler = map[string]localAPIHandler{
 	"tka/disable":                 (*Handler).serveTKADisable,
 	"tka/force-local-disable":     (*Handler).serveTKALocalDisable,
 	"tka/affected-sigs":           (*Handler).serveTKAAffectedSigs,
+	"tka/wrap-preauth-key":        (*Handler).serveTKAWrapPreauthKey,
 	"upload-client-metrics":       (*Handler).serveUploadClientMetrics,
 	"watch-ipn-bus":               (*Handler).serveWatchIPNBus,
 	"whois":                       (*Handler).serveWhoIs,
@@ -121,8 +125,10 @@ var (
 	metrics   = map[string]*clientmetric.Metric{}
 )
 
-func NewHandler(b *ipnlocal.LocalBackend, logf logger.Logf, logID string) *Handler {
-	return &Handler{b: b, logf: logf, backendLogID: logID}
+// NewHandler creates a new LocalAPI HTTP handler. All parameters except netMon
+// are required (if non-nil it's used to do faster interface lookups).
+func NewHandler(b *ipnlocal.LocalBackend, logf logger.Logf, netMon *netmon.Monitor, logID logid.PublicID) *Handler {
+	return &Handler{b: b, logf: logf, netMon: netMon, backendLogID: logID}
 }
 
 type Handler struct {
@@ -146,7 +152,8 @@ type Handler struct {
 
 	b            *ipnlocal.LocalBackend
 	logf         logger.Logf
-	backendLogID string
+	netMon       *netmon.Monitor // optional; nil means interfaces will be looked up on-demand
+	backendLogID logid.PublicID
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -637,7 +644,10 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var logLock sync.Mutex
+	var (
+		logLock     sync.Mutex
+		handlerDone bool
+	)
 	logf := func(format string, args ...any) {
 		if !strings.HasSuffix(format, "\n") {
 			format = format + "\n"
@@ -646,12 +656,25 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 		logLock.Lock()
 		defer logLock.Unlock()
 
+		// The portmapper can call this log function after the HTTP
+		// handler returns, which is not allowed and can cause a panic.
+		// If this happens, ignore the log lines since this typically
+		// occurs due to a client disconnect.
+		if handlerDone {
+			return
+		}
+
 		// Write and flush each line to the client so that output is streamed
 		fmt.Fprintf(w, format, args...)
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
 	}
+	defer func() {
+		logLock.Lock()
+		handlerDone = true
+		logLock.Unlock()
+	}()
 
 	ctx, cancel := context.WithTimeout(r.Context(), dur)
 	defer cancel()
@@ -659,7 +682,7 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 	done := make(chan bool, 1)
 
 	var c *portmapper.Client
-	c = portmapper.NewClient(logger.WithPrefix(logf, "portmapper: "), debugKnobs, func() {
+	c = portmapper.NewClient(logger.WithPrefix(logf, "portmapper: "), h.netMon, debugKnobs, func() {
 		logf("portmapping changed.")
 		logf("have mapping: %v", c.HaveMapping())
 
@@ -673,7 +696,9 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 		}
 		logf("cb: no mapping")
 	})
-	linkMon, err := monitor.New(logger.WithPrefix(logf, "monitor: "))
+	defer c.Close()
+
+	netMon, err := netmon.New(logger.WithPrefix(logf, "monitor: "))
 	if err != nil {
 		logf("error creating monitor: %v", err)
 		return
@@ -685,14 +710,14 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 			self = netip.MustParseAddr(b)
 			return gw, self, true
 		}
-		return linkMon.GatewayAndSelfIP()
+		return netMon.GatewayAndSelfIP()
 	}
 
 	c.SetGatewayLookupFunc(gatewayAndSelfIP)
 
 	gw, selfIP, ok := gatewayAndSelfIP()
 	if !ok {
-		logf("no gateway or self IP; %v", linkMon.InterfaceState())
+		logf("no gateway or self IP; %v", netMon.InterfaceState())
 		return
 	}
 	logf("gw=%v; self=%v", gw, selfIP)
@@ -848,6 +873,34 @@ func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
 	e := json.NewEncoder(w)
 	e.SetIndent("", "\t")
 	e.Encode(st)
+}
+
+func (h *Handler) serveDebugPeerEndpointChanges(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitRead {
+		http.Error(w, "status access denied", http.StatusForbidden)
+		return
+	}
+
+	ipStr := r.FormValue("ip")
+	if ipStr == "" {
+		http.Error(w, "missing 'ip' parameter", 400)
+		return
+	}
+	ip, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		http.Error(w, "invalid IP", 400)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	chs, err := h.b.GetPeerEndpointChanges(r.Context(), ip)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	e := json.NewEncoder(w)
+	e.SetIndent("", "\t")
+	e.Encode(chs)
 }
 
 // InUseOtherUserIPNStream reports whether r is a request for the watch-ipn-bus
@@ -1523,6 +1576,40 @@ func (h *Handler) serveTKAModify(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
+func (h *Handler) serveTKAWrapPreauthKey(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "network-lock modify access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type wrapRequest struct {
+		TSKey  string
+		TKAKey string // key.NLPrivate.MarshalText
+	}
+	var req wrapRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 12*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	var priv key.NLPrivate
+	if err := priv.UnmarshalText([]byte(req.TKAKey)); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	wrappedKey, err := h.b.NetworkLockWrapPreauthKey(req.TSKey, priv)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(200)
+	w.Write([]byte(wrappedKey))
+}
+
 func (h *Handler) serveTKADisable(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
 		http.Error(w, "network-lock modify access denied", http.StatusForbidden)
@@ -1736,6 +1823,47 @@ func (h *Handler) serveDebugCapture(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 	w.(http.Flusher).Flush()
 	h.b.StreamDebugCapture(r.Context(), w)
+}
+
+func (h *Handler) serveDebugLog(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitRead {
+		http.Error(w, "debug-log access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	defer h.b.TryFlushLogs() // kick off upload after we're done logging
+
+	type logRequestJSON struct {
+		Lines  []string
+		Prefix string
+	}
+
+	var logRequest logRequestJSON
+	if err := json.NewDecoder(r.Body).Decode(&logRequest); err != nil {
+		http.Error(w, "invalid JSON body", 400)
+		return
+	}
+
+	prefix := logRequest.Prefix
+	if prefix == "" {
+		prefix = "debug-log"
+	}
+	logf := logger.WithPrefix(h.logf, prefix+": ")
+
+	// We can write logs too fast for logtail to handle, even when
+	// opting-out of rate limits. Limit ourselves to at most one message
+	// per 20ms and a burst of 60 log lines, which should be fast enough to
+	// not block for too long but slow enough that we can upload all lines.
+	logf = logger.SlowLoggerWithClock(r.Context(), logf, 20*time.Millisecond, 60, time.Now)
+
+	for _, line := range logRequest.Lines {
+		logf("%s", line)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 var (

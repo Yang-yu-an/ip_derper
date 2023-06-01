@@ -35,7 +35,7 @@ type derpProber struct {
 	meshInterval time.Duration
 	tlsInterval  time.Duration
 
-	// Probe functions that can be overriden for testing.
+	// Probe functions that can be overridden for testing.
 	tlsProbeFn  func(string) ProbeFunc
 	udpProbeFn  func(string, int) ProbeFunc
 	meshProbeFn func(string, string) ProbeFunc
@@ -273,6 +273,17 @@ func derpProbeNodePair(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailc
 		time.Sleep(100 * time.Millisecond) // pretty arbitrary
 	}
 
+	latency, err = runDerpProbeNodePair(ctx, from, to, fromc, toc)
+	if err != nil {
+		// Record pubkeys on failed probes to aid investigation.
+		err = fmt.Errorf("%s -> %s: %w",
+			fromc.SelfPublicKey().ShortString(),
+			toc.SelfPublicKey().ShortString(), err)
+	}
+	return latency, err
+}
+
+func runDerpProbeNodePair(ctx context.Context, from, to *tailcfg.DERPNode, fromc, toc *derphttp.Client) (latency time.Duration, err error) {
 	// Make a random packet
 	pkt := make([]byte, 8)
 	crand.Read(pkt)
@@ -335,7 +346,7 @@ func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode) (*de
 		return !strings.Contains(s, "derphttp.Client.Connect: connecting to")
 	})
 	priv := key.NewNode()
-	dc := derphttp.NewRegionClient(priv, l, func() *tailcfg.DERPRegion {
+	dc := derphttp.NewRegionClient(priv, l, nil /* no netMon */, func() *tailcfg.DERPRegion {
 		rid := n.RegionID
 		return &tailcfg.DERPRegion{
 			RegionID:   rid,

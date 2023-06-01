@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"tailscale.com/envknob"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/goroutines"
@@ -83,6 +84,19 @@ func (b *LocalBackend) handleC2N(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(res)
+	case "/sockstats":
+		if r.Method != "POST" {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		if b.sockstatLogger == nil {
+			http.Error(w, "no sockstatLogger", http.StatusInternalServerError)
+			return
+		}
+		b.sockstatLogger.Flush()
+		fmt.Fprintf(w, "logid: %s\n", b.sockstatLogger.LogID())
+		fmt.Fprintf(w, "debug info: %v\n", sockstats.DebugInfo())
 	default:
 		http.Error(w, "unknown c2n path", http.StatusBadRequest)
 	}
